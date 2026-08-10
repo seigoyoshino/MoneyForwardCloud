@@ -413,26 +413,22 @@ st.markdown(f"""<style>
 </style>""", unsafe_allow_html=True)
 
 # ---- 認証 ----
-email, auth_debug = user_info()
-full_users = emails_from_secret("FULL_USERS")
-settle_users = emails_from_secret("SETTLE_USERS")
-role = "full" if email in full_users else "settle" if email in settle_users else None
+def view_mode() -> str:
+    """このアプリが何を表示するかを Secrets の VIEW で決める。
+    'full'   → 全タブ（自分用）
+    'settle' → 清算ビューのみ（共有用）
+    アクセス制限は Streamlit の Viewers 設定で行うため、ここではメール判定をしない。
+    """
+    try:
+        v = str(st.secrets.get("VIEW", "full")).strip().lower()
+    except Exception:
+        v = "full"
+    return "settle" if v.startswith("s") else "full"
 
-if email is None:
-    st.error("ログイン情報を取得できませんでした。共有リンクからGoogleアカウントでログインして開いてください。")
-    with st.expander("🔍 診断情報（設定確認用）"):
-        st.write("**取得できたユーザー情報:**")
-        st.json(auth_debug)
-        st.write(f"**Secretsの許可メール:** FULL={sorted(full_users)} / SETTLE={sorted(settle_users)}")
-        st.caption(
-            "st.user が空の場合、アプリの共有設定でGoogleログインが要求されていない可能性があります。"
-            "一時的な回避策として、Secrets に `DEV_USER = \"あなたのGmail\"` を追加すると表示できます。"
-        )
-elif role is None:
-    st.error(f"このアプリの閲覧権限がありません（{email}）。")
-    st.caption(f"Secretsに登録されているのは FULL={sorted(full_users)} / SETTLE={sorted(settle_users)} です。"
-               "綴りが一致しているか確認してください。")
-else:
+
+role = view_mode()
+
+if True:
     # ---- データ読込（非公開リポジトリから取得して復号）----
     def sec(name: str, default: str = "") -> str:
         try:
@@ -486,7 +482,7 @@ else:
                 fetch_bundle.clear()
                 decrypt_bundle.clear()
                 st.rerun()
-            st.sidebar.caption(f"ログイン: {email}")
+            st.sidebar.caption("清算ビュー" if role == "settle" else "全体ビュー")
 
             # ================= 清算のみ =================
             if role == "settle":
