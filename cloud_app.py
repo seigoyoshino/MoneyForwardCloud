@@ -161,22 +161,47 @@ def decrypt_bundle(token: bytes, key: str) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-def current_email() -> str | None:
+def user_info() -> tuple[str | None, dict]:
+    """ログイン中のメールアドレスと、診断用の生データを返す。"""
+    debug: dict = {}
     for attr in ("user", "experimental_user"):
         try:
-            u = getattr(st, attr)
-            em = getattr(u, "email", None)
-            if not em and hasattr(u, "get"):
-                em = u.get("email")
-            if em:
-                return str(em).strip().lower()
-        except Exception:
-            pass
-    try:  # ローカル動作確認用
-        dev = st.secrets.get("DEV_USER", "")
-        return str(dev).strip().lower() or None
+            u = getattr(st, attr, None)
+            if u is None:
+                debug[attr] = "なし"
+                continue
+            # dict 化を試みる（環境によって型が違うため）
+            d = None
+            for conv in (lambda x: dict(x), lambda x: x.to_dict(), lambda x: vars(x)):
+                try:
+                    d = conv(u)
+                    break
+                except Exception:
+                    continue
+            debug[attr] = d if d is not None else str(u)[:200]
+            em = None
+            if isinstance(d, dict):
+                for k in ("email", "user_email", "mail", "preferred_username", "name"):
+                    if d.get(k):
+                        em = d[k]
+                        break
+            if not em:
+                em = getattr(u, "email", None)
+            if em and "@" in str(em):
+                return str(em).strip().lower(), debug
+        except Exception as e:
+            debug[attr] = f"取得エラー: {type(e).__name__}"
+    try:
+        dev = str(st.secrets.get("DEV_USER", "")).strip().lower()
+        if dev:
+            return dev, debug
     except Exception:
-        return None
+        pass
+    return None, debug
+
+
+def current_email() -> str | None:
+    return user_info()[0]
 
 
 def display_names() -> tuple[str, str]:
@@ -388,15 +413,25 @@ st.markdown(f"""<style>
 </style>""", unsafe_allow_html=True)
 
 # ---- 認証 ----
-email = current_email()
+email, auth_debug = user_info()
 full_users = emails_from_secret("FULL_USERS")
 settle_users = emails_from_secret("SETTLE_USERS")
 role = "full" if email in full_users else "settle" if email in settle_users else None
 
 if email is None:
     st.error("ログイン情報を取得できませんでした。共有リンクからGoogleアカウントでログインして開いてください。")
+    with st.expander("🔍 診断情報（設定確認用）"):
+        st.write("**取得できたユーザー情報:**")
+        st.json(auth_debug)
+        st.write(f"**Secretsの許可メール:** FULL={sorted(full_users)} / SETTLE={sorted(settle_users)}")
+        st.caption(
+            "st.user が空の場合、アプリの共有設定でGoogleログインが要求されていない可能性があります。"
+            "一時的な回避策として、Secrets に `DEV_USER = \"あなたのGmail\"` を追加すると表示できます。"
+        )
 elif role is None:
     st.error(f"このアプリの閲覧権限がありません（{email}）。")
+    st.caption(f"Secretsに登録されているのは FULL={sorted(full_users)} / SETTLE={sorted(settle_users)} です。"
+               "綴りが一致しているか確認してください。")
 else:
     # ---- データ読込（非公開リポジトリから取得して復号）----
     def sec(name: str, default: str = "") -> str:
