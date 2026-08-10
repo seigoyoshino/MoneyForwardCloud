@@ -64,8 +64,10 @@ def fyen(n) -> str:
 
 
 def fyen_x(v) -> str:
-    s = f"{abs(v):,.2f}".rstrip("0").rstrip(".")
-    return ("−" if v < 0 else "") + "¥" + s
+    """清算ビューの金額表示（円未満は切り捨て）。"""
+    v = 0 if v is None or pd.isna(v) else v
+    n = math.floor(abs(v))
+    return ("−" if v < 0 else "") + f"¥{n:,.0f}"
 
 
 def man_label(v) -> str:
@@ -223,6 +225,18 @@ def emails_from_secret(name: str) -> set[str]:
     return {e.strip().lower() for e in str(v).split(",") if e.strip()}
 
 
+MONEY_COLS = ("金額", "僕", "合計", "直近の請求", "月平均", "累計")
+
+
+def show_settle_table(rows, partner_name: str = "", **kw):
+    """清算ビューの表を、金額列を右揃えにして描画する。"""
+    df = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    targets = set(MONEY_COLS) | ({partner_name} if partner_name else set())
+    cols = [c for c in df.columns if c in targets]
+    sty = df.style.set_properties(subset=cols, **{"text-align": "right"}) if cols else df
+    st.dataframe(sty, width="stretch", hide_index=True, **kw)
+
+
 # ---------- 清算（閲覧専用） ----------
 def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
     NM_ME, NM_PT = display_names()
@@ -257,11 +271,11 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
         me_sum = sum(float(r.get("僕") or 0) for r in rows)
         wf_sum = sum(_pt_val(r) for r in rows)
         if rows:
-            st.dataframe(pd.DataFrame([{
+            show_settle_table(pd.DataFrame([{
                 "項目": r.get("項目", ""), "僕": fyen(float(r.get("僕") or 0)),
                 NM_PT: fyen(_pt_val(r)),
                 "メモ": r.get("メモ", ""),
-            } for r in rows]), width="stretch", hide_index=True)
+            } for r in rows]), NM_PT)
             memos = [r for r in rows if str(r.get("メモ", "")).strip()]
             if memos:
                 from html import escape
@@ -291,7 +305,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
         rows_view.append({"日付": "—", "内容": f"{NM_PT}のローン負担（手入力）", "中項目": "—",
                           "金額": fyen(wife_loan)})
         rows_view.append({"日付": "", "内容": "合計", "中項目": "", "金額": fyen_x(rent_total)})
-        st.dataframe(pd.DataFrame(rows_view), width="stretch", hide_index=True)
+        show_settle_table(rows_view, NM_PT)
 
     # ② 固定費
     st.subheader(f"② 固定費（折半 {NM_ME}{s_me} : {NM_PT}{s_wf}）")
@@ -303,7 +317,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                         NM_PT: fyen_x(amt - me)})
         fx_auto_me += me
         fx_auto_wf += amt - me
-    st.dataframe(pd.DataFrame(fx_view), width="stretch", hide_index=True)
+    show_settle_table(fx_view, NM_PT)
     with st.expander("▼ 固定費の対象明細を見る"):
         fxd = mrows[mrows["sub"].isin(fx_subs)].sort_values(["sub", "date"])
         if fxd.empty:
@@ -319,7 +333,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                                       "金額": fyen(-r.amount)})
                 rows_view.append({"中項目": f"── {s} 小計", "日付": "", "内容": "",
                                   "金額": fyen_x(-g["amount"].sum())})
-            st.dataframe(pd.DataFrame(rows_view), width="stretch", hide_index=True)
+            show_settle_table(rows_view, NM_PT)
     st.markdown("**手入力の追加項目**")
     fx_man_me, fx_man_wf = manual_view(rec.get("fixed_manual", []))
     fx_me = fx_auto_me + fx_man_me
@@ -342,7 +356,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                         NM_ME: fyen_x(me), NM_PT: fyen_x(amt - me)})
         sp_split_me += me
         sp_split_wf += amt - me
-    st.dataframe(pd.DataFrame(sp_view), width="stretch", hide_index=True)
+    show_settle_table(sp_view, NM_PT)
     with st.expander("▼ 特殊費用の対象明細を見る"):
         tgt = mrows[mrows["sub"].isin(list(sp_full) + list(sp_split))].sort_values(["sub", "date"])
         if tgt.empty:
@@ -359,7 +373,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                                       "計算対象": "対象" if r.calc == 1 else "対象外"})
                 rows_view.append({"中項目": f"── {s} 小計", "日付": "", "内容": "",
                                   "金額": fyen_x(-g["amount"].sum()), "計算対象": ""})
-            st.dataframe(pd.DataFrame(rows_view), width="stretch", hide_index=True)
+            show_settle_table(rows_view, NM_PT)
     st.markdown("**手入力の追加項目**")
     sp_man_me, sp_man_wf = manual_view(rec.get("special_manual", []))
     sp_me_amt = sp_split_me + sp_man_me
