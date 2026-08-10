@@ -225,16 +225,10 @@ def emails_from_secret(name: str) -> set[str]:
     return {e.strip().lower() for e in str(v).split(",") if e.strip()}
 
 
-MONEY_COLS = ("金額", "僕", "合計", "直近の請求", "月平均", "累計")
-
-
 def show_settle_table(rows, partner_name: str = "", **kw):
-    """清算ビューの表を、金額列を右揃えにして描画する。"""
+    """清算ビューの表を描画する（数値列の右揃えはグローバルCSS/JSで適用）。"""
     df = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
-    targets = set(MONEY_COLS) | ({partner_name} if partner_name else set())
-    cols = [c for c in df.columns if c in targets]
-    sty = df.style.set_properties(subset=cols, **{"text-align": "right"}) if cols else df
-    st.dataframe(sty, width="stretch", hide_index=True, **kw)
+    st.dataframe(df, width="stretch", hide_index=True, **kw)
 
 
 # ---------- 清算（閲覧専用） ----------
@@ -426,9 +420,57 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
 st.set_page_config(page_title="家計ダッシュボード", page_icon="🧾", layout="wide")
 st.markdown(f"""<style>
   [data-testid="stMetricValue"] {{ font-variant-numeric: tabular-nums; }}
+  [data-testid="stDataFrame"] [role="gridcell"][data-num="1"],
+  [data-testid="stDataFrame"] [role="columnheader"][data-num="1"] {{
+    text-align: right !important; justify-content: flex-end !important;
+  }}
+  [data-testid="stDataFrame"] [role="gridcell"][data-num="1"] > *,
+  [data-testid="stDataFrame"] [role="columnheader"][data-num="1"] > * {{
+    text-align: right !important; width: 100%;
+  }}
+  [data-testid="stDataFrame"] {{ font-variant-numeric: tabular-nums; }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
 </style>""", unsafe_allow_html=True)
+
+# 表の数値セルを検出して右揃えの印を付ける
+st.iframe(
+    r"""
+    <script>
+    const doc = window.parent.document;
+    const isNum = (t) => {
+      const s = (t || "").trim();
+      if (!s) return false;
+      return /^[+\-−]?[¥￥]?[\d,]+(\.\d+)?%?$/.test(s) || /^[+\-−]?[¥￥][\d,]+/.test(s);
+    };
+    const mark = () => {
+      doc.querySelectorAll('[data-testid="stDataFrame"]').forEach(tbl => {
+        const cells = tbl.querySelectorAll('[role="gridcell"]');
+        const numCols = {};
+        cells.forEach(c => {
+          const col = c.getAttribute('aria-colindex');
+          if (!col) return;
+          if (!(col in numCols)) numCols[col] = {n: 0, t: 0};
+          const txt = c.innerText;
+          if (txt && txt.trim()) { numCols[col].t++; if (isNum(txt)) numCols[col].n++; }
+        });
+        const right = new Set(Object.keys(numCols).filter(k => numCols[k].t > 0 && numCols[k].n / numCols[k].t >= 0.7));
+        cells.forEach(c => {
+          const col = c.getAttribute('aria-colindex');
+          if (right.has(col)) c.setAttribute('data-num', '1');
+        });
+        tbl.querySelectorAll('[role="columnheader"]').forEach(h => {
+          const col = h.getAttribute('aria-colindex');
+          if (right.has(col)) h.setAttribute('data-num', '1');
+        });
+      });
+    };
+    mark();
+    setInterval(mark, 700);
+    </script>
+    """,
+    height=1,
+)
 
 # ---- 認証 ----
 def view_mode() -> str:
