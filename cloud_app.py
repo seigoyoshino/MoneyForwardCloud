@@ -239,7 +239,11 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
 
     s_month = st.selectbox("清算対象月", list(reversed(months)), format_func=month_label)
     rec = mons.get(s_month, {})
-    wife_loan = int(rec.get("wife_loan", 0))
+    # 元利均等返済で毎月同額のため、月ごとの入力がなければ既定額を使う
+    if "wife_loan" in rec:
+        wife_loan = int(rec["wife_loan"])
+    else:
+        wife_loan = int(cfg.get("wife_loan_default", 0))
     mrows = master[master["month"] == s_month]
 
     def _pt_val(r: dict) -> float:
