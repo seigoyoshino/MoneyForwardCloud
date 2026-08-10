@@ -419,6 +419,9 @@ def view_mode() -> str:
     'settle' → 清算ビューのみ（共有用）
     アクセス制限は Streamlit の Viewers 設定で行うため、ここではメール判定をしない。
     """
+    forced = st.session_state.get("_force_view")
+    if forced:
+        return "settle" if str(forced).startswith("s") else "full"
     try:
         v = str(st.secrets.get("VIEW", "full")).strip().lower()
     except Exception:
