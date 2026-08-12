@@ -313,6 +313,16 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
         wife_loan = int(cfg.get("wife_loan_default", 0))
     mrows = master[master["month"] == s_month]
 
+    # 以下2つは settlement.json に保存された「キー」を読むためのもの。
+    # 表示名（NM_ME / NM_PT）とは別物で、ローカル版は "僕" / "パートナー" で保存する。
+    # 表示名を Secrets で変えても金額が 0 にならないよう、保存側のキーで引く。
+    def _me_val(r: dict) -> float:
+        """本人側の金額を取り出す（保存時の列名ゆれに対応）。"""
+        for k in ("僕", NM_ME, "me"):
+            if k in r and r.get(k) not in (None, ""):
+                return float(r[k])
+        return 0.0
+
     def _pt_val(r: dict) -> float:
         """パートナー側の金額を取り出す（保存時の列名ゆれに対応）。"""
         for k in (NM_PT, "妻", "partner"):
@@ -321,12 +331,12 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
         return 0.0
 
     def manual_view(rows: list) -> tuple[float, float]:
-        me_sum = sum(float(r.get("僕") or 0) for r in rows)
+        me_sum = sum(_me_val(r) for r in rows)
         wf_sum = sum(_pt_val(r) for r in rows)
         if rows:
             # メモは直下の「📝 メモ全文」に全文が出るので、狭い画面を圧迫する列は持たせない
             show_settle_table(pd.DataFrame([{
-                "項目": r.get("項目", ""), "僕": fyen(float(r.get("僕") or 0)),
+                "項目": r.get("項目", ""), NM_ME: fyen(_me_val(r)),
                 NM_PT: fyen(_pt_val(r)),
             } for r in rows]), NM_PT)
             memos = [r for r in rows if str(r.get("メモ", "")).strip()]
@@ -371,7 +381,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
     for s in fx_subs:
         amt = -mrows.loc[mrows["sub"] == s, "amount"].sum()
         me = amt * s_share
-        fx_view.append({"項目": s, "金額": fyen_x(amt), "僕": fyen_x(me),
+        fx_view.append({"項目": s, "金額": fyen_x(amt), NM_ME: fyen_x(me),
                         NM_PT: fyen_x(amt - me)})
         fx_auto_me += me
         fx_auto_wf += amt - me
