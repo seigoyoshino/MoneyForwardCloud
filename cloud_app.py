@@ -94,27 +94,36 @@ def html_table(df, height: int | None = None, **_ignored):
         st.caption("表示する行がありません。")
         return
     num_re = _re.compile(r"^[+\-−]?[¥￥]?[\d,]+(\.\d+)?\s*(%|pt|円|件)?(（.*）)?$")
+    date_re = _re.compile(r"^\d{2,4}[-/]\d{1,2}([-/]\d{1,2})?$")
+
+    def _col_ratio(col, pattern) -> float:
+        vals = [str(v).strip() for v in df[col]
+                if str(v).strip() not in ("", "—", "-", "nan", "None")]
+        if not vals:
+            return 0.0
+        return sum(1 for v in vals if pattern.match(v)) / len(vals)
 
     def _is_num_col(col) -> bool:
         if pd.api.types.is_numeric_dtype(df[col]):
             return True
-        vals = [str(v).strip() for v in df[col]
-                if str(v).strip() not in ("", "—", "-", "nan", "None")]
-        if not vals:
-            return False
-        return sum(1 for v in vals if num_re.match(v)) / len(vals) >= 0.6
+        return _col_ratio(col, num_re) >= 0.6
 
     right = {c for c in df.columns if _is_num_col(c)}
-    head = "".join(
-        f"<th style='text-align:{'right' if c in right else 'left'}'>{escape(str(c))}</th>"
-        for c in df.columns)
+    # 金額・日付は途中で折り返すと読み違える（「−」だけが行末に残る、"2026-" と "07-28" に割れる）
+    # ため、狭い画面でも1トークンのまま保つ。
+    nowrap = right | {c for c in df.columns if _col_ratio(c, date_re) >= 0.6}
+
+    def _style(c, align_only=False) -> str:
+        s = f"text-align:{'right' if c in right else 'left'}"
+        return s if align_only else s + (";white-space:nowrap" if c in nowrap else "")
+
+    head = "".join(f"<th style='{_style(c)}'>{escape(str(c))}</th>" for c in df.columns)
     body = []
     for _, r in df.iterrows():
         tds = []
         for c in df.columns:
             v = "" if pd.isna(r[c]) else str(r[c])
-            al = "right" if c in right else "left"
-            tds.append(f"<td style='text-align:{al}'>{escape(v)}</td>")
+            tds.append(f"<td style='{_style(c)}'>{escape(v)}</td>")
         body.append("<tr>" + "".join(tds) + "</tr>")
     box = f"max-height:{height}px;overflow-y:auto;" if height else ""
     st.markdown(
@@ -127,6 +136,10 @@ def html_table(df, height: int | None = None, **_ignored):
 
 
 
+# スマホ対策: ツールバーはグラフ上部（凡例の位置）にかぶるので出さない。
+PLOTLY_CONFIG = {"displayModeBar": False, "scrollZoom": False}
+
+
 def base_layout(fig: go.Figure, height=320) -> go.Figure:
     fig.update_layout(
         height=height, margin=dict(l=10, r=10, t=24, b=10),
@@ -134,6 +147,8 @@ def base_layout(fig: go.Figure, height=320) -> go.Figure:
         font=dict(color=INK, size=12),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         hovermode="closest",
+        # 既定の dragmode="zoom" はタッチのドラッグを奪い、グラフ上で縦スクロールできなくなる
+        dragmode=False,
     )
     fig.update_yaxes(gridcolor=LINE, tickformat=",", zeroline=True, zerolinecolor=SUBTLE)
     fig.update_xaxes(showgrid=False, linecolor=LINE)
@@ -687,7 +702,7 @@ if role:
                     peak = max(trend["収入"].max(), trend["支出"].max()) if len(trend) else 0
                     if peak > 0:
                         fig.update_yaxes(range=[min(0, trend["収支"].min() * 1.1), peak * 1.22])
-                    st.plotly_chart(base_layout(fig), width="stretch")
+                    st.plotly_chart(base_layout(fig), width="stretch", config=PLOTLY_CONFIG)
 
                     exp = period[period["amount"] < 0]
                     cat_sum = (-exp.groupby("cat")["amount"].sum()).sort_values(ascending=False)
@@ -706,7 +721,7 @@ if role:
                             hovertemplate="%{y}: %{x:,.0f}円<extra></extra>"))
                         fig.update_xaxes(range=[0, float(vals.max()) * 1.5])
                         st.plotly_chart(base_layout(fig, height=max(300, 26 * len(vals) + 80)),
-                                        width="stretch")
+                                        width="stretch", config=PLOTLY_CONFIG)
                         st.caption(f"合計 {fyen(total)}")
 
                     st.subheader(f"支出トップ10（{period_label}）")
@@ -742,7 +757,8 @@ if role:
                                       annotation_font_size=11)
                         if series.max() > 0:
                             fig.update_yaxes(range=[0, float(series.max()) * 1.25])
-                        st.plotly_chart(base_layout(fig, height=260), width="stretch")
+                        st.plotly_chart(base_layout(fig, height=260), width="stretch",
+                                        config=PLOTLY_CONFIG)
 
                         sub_sum = (-exp[exp["cat"] == sel_cat].groupby("sub")["amount"].sum()
                                    ).sort_values()
@@ -758,7 +774,7 @@ if role:
                             fig.update_xaxes(range=[0, float(sub_sum.max()) * 1.5])
                         st.plotly_chart(
                             base_layout(fig, height=max(200, 34 * len(sub_sum) + 60)),
-                            width="stretch")
+                            width="stretch", config=PLOTLY_CONFIG)
 
                         pick = st.selectbox("明細を中項目で絞り込み",
                                             ["すべて"] + sub_sum.sort_values(ascending=False)
@@ -808,7 +824,8 @@ if role:
                                         textangle=-90 if many else 0,
                                         textfont=dict(size=9, color=tcolor))
                     fig.update_layout(barmode="stack")
-                    st.plotly_chart(base_layout(fig, height=300), width="stretch")
+                    st.plotly_chart(base_layout(fig, height=300), width="stretch",
+                                    config=PLOTLY_CONFIG)
 
                     subs_all = valid[(valid["sub"] == "サブスク") & (valid["amount"] < 0)]
                     if not subs_all.empty:
