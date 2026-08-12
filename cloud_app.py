@@ -309,10 +309,10 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
         me_sum = sum(float(r.get("僕") or 0) for r in rows)
         wf_sum = sum(_pt_val(r) for r in rows)
         if rows:
+            # メモは直下の「📝 メモ全文」に全文が出るので、狭い画面を圧迫する列は持たせない
             show_settle_table(pd.DataFrame([{
                 "項目": r.get("項目", ""), "僕": fyen(float(r.get("僕") or 0)),
                 NM_PT: fyen(_pt_val(r)),
-                "メモ": r.get("メモ", ""),
             } for r in rows]), NM_PT)
             memos = [r for r in rows if str(r.get("メモ", "")).strip()]
             if memos:
@@ -334,9 +334,14 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
     rent_total = rent_mf + wife_loan
     rent_me_amt = rent_total * r_share
     rent_wf_amt = rent_total - rent_me_amt
-    st.markdown(f"MF側 {fyen(rent_mf)} ＋ {NM_PT}ローン {fyen(wife_loan)} ＝ "
-                f"**{fyen_x(rent_total)}** → 僕 **{fyen_x(rent_me_amt)}** ／ "
-                f"{NM_PT} **{fyen_x(rent_wf_amt)}**")
+    # 1行の長文はスマホで2行に折り返り、肝心の負担額が文中に埋もれるため表にする
+    show_settle_table([
+        {"項目": "MF側の家賃・管理費", "金額": fyen(rent_mf)},
+        {"項目": f"＋ {NM_PT}のローン負担", "金額": fyen(wife_loan)},
+        {"項目": "＝ 家賃合計", "金額": fyen_x(rent_total)},
+        {"項目": f"→ {NM_ME}の負担", "金額": fyen_x(rent_me_amt)},
+        {"項目": f"→ {NM_PT}の負担", "金額": fyen_x(rent_wf_amt)},
+    ], NM_PT)
     with st.expander("▼ 家賃の対象明細を見る"):
         rows_view = [{"日付": r.date, "内容": r.content, "中項目": r.sub, "金額": fyen(-r.amount)}
                      for r in rent_rows.sort_values("date").itertuples()]
@@ -380,21 +385,25 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
 
     # ③ 特殊費用
     st.subheader("③ 特殊費用（計算対象外の明細も含む）")
+    # 「割合」を独立した列に持つと5列になり、スマホでは1セルが3〜4行に折り返って崩れる。
+    # 全額負担の行だけ項目名に添え、②固定費と同じ4列に揃える（折半比率は下のcaptionに出す）。
     sp_view = []
     sp_full_wf = sp_split_me = sp_split_wf = 0.0
     for s in sp_full:
         amt = -mrows.loc[mrows["sub"] == s, "amount"].sum()
-        sp_view.append({"項目": s, "割合": f"{NM_PT}の全額負担", "金額": fyen_x(amt),
+        sp_view.append({"項目": f"{s}（全額{NM_PT}）", "金額": fyen_x(amt),
                         NM_ME: fyen_x(0), NM_PT: fyen_x(amt)})
         sp_full_wf += amt
     for s in sp_split:
         amt = -mrows.loc[mrows["sub"] == s, "amount"].sum()
         me = amt * s_share
-        sp_view.append({"項目": s, "割合": f"折半 {s_me}:{s_wf}", "金額": fyen_x(amt),
+        sp_view.append({"項目": s, "金額": fyen_x(amt),
                         NM_ME: fyen_x(me), NM_PT: fyen_x(amt - me)})
         sp_split_me += me
         sp_split_wf += amt - me
     show_settle_table(sp_view, NM_PT)
+    if sp_split:
+        st.caption(f"「（全額{NM_PT}）」以外は折半 {NM_ME}{s_me} : {NM_PT}{s_wf}")
     with st.expander("▼ 特殊費用の対象明細を見る"):
         tgt = mrows[mrows["sub"].isin(list(sp_full) + list(sp_split))].sort_values(["sub", "date"])
         if tgt.empty:
@@ -405,12 +414,13 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                 g = tgt[tgt["sub"] == s]
                 if g.empty:
                     continue
+                # 「計算対象」列を独立させると5列で崩れるので、対象外の行だけ内容に注記する
                 for r in g.itertuples():
-                    rows_view.append({"中項目": r.sub, "日付": r.date, "内容": r.content,
-                                      "金額": fyen(-r.amount),
-                                      "計算対象": "対象" if r.calc == 1 else "対象外"})
+                    rows_view.append({"中項目": r.sub, "日付": r.date,
+                                      "内容": r.content + ("" if r.calc == 1 else "（計算対象外）"),
+                                      "金額": fyen(-r.amount)})
                 rows_view.append({"中項目": f"── {s} 小計", "日付": "", "内容": "",
-                                  "金額": fyen_x(-g["amount"].sum()), "計算対象": ""})
+                                  "金額": fyen_x(-g["amount"].sum())})
             show_settle_table(rows_view, NM_PT)
     st.markdown("**手入力の追加項目**")
     sp_man_me, sp_man_wf = manual_view(rec.get("special_manual", []))
