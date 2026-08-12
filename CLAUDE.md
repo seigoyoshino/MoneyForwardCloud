@@ -1,0 +1,99 @@
+# 家計ダッシュボード — 開発の前提
+
+MoneyForwardの「収入・支出詳細」エクスポートを可視化する個人用ダッシュボード。
+Streamlit製。ローカル版とクラウド版（閲覧専用）の2本立てで、コードの大半は共通の思想で書かれている。
+
+## 最重要のルール
+
+1. **`data/` と `input/` は絶対にコミットしない。** 生の家計明細と復号キーが入っている。
+   `.gitignore` で除外済みだが、`git status` で混入していないか毎回確認すること。
+2. **公開リポジトリ（MoneyForwardCloud）に実名・メールアドレス・金額を書かない。**
+   表示名は Secrets の `NAME_ME` / `NAME_PARTNER` から取得する仕組みになっている。
+   ハードコードしないこと。
+3. **画面の変更は app.py と cloud_app.py の両方に反映が必要**なことが多い。
+   片方だけ直して終わりにしない（清算ロジック・表示関数はほぼ同じものが両方にある）。
+
+## リポジトリ構成（2つある）
+
+| パス | GitHub | 公開 | 中身 |
+|---|---|---|---|
+| `C:\Users\seigo\Git\MoneyForwardDashboard` | seigoyoshino/MoneyForwardDashboard | **非公開** | ローカル版 `app.py`、データ、暗号化済み `cloud_data/bundle.enc` |
+| `C:\Users\seigo\Git\MoneyForwardCloud` | seigoyoshino/MoneyForwardCloud | 公開 | クラウド版 `cloud_app.py`、`requirements.txt` のみ（データなし） |
+
+`cloud_app.py` の編集後は MoneyForwardCloud 側にコピーして push する。
+（`settle_app.py` はStreamlit Cloud時代の名残。Render移行後は未使用）
+
+## データの流れ
+
+```
+MoneyForwardからDL → input/ に置く
+  → アプリ起動時に自動取込（IDで重複排除・内容変更は上書き）
+  → data/transactions.csv（明細マスター・生データ）
+  → update_cloud_data.bat（tools/export_cloud.py でマスク＋暗号化 → git push）
+  → 非公開リポジトリの cloud_data/bundle.enc
+  → クラウド版がGitHub API経由で取得し、Secretsの鍵で復号して表示
+```
+
+- クラウド版は**閲覧専用**。編集機能を追加してはいけない（ローカルが唯一の正）
+- マスク処理: 内容・メモ欄の5桁以上の数字列を「＊＊＊」に置換（口座番号対策）
+- 明細の**削除**だけは自動反映されない → データタブの「特定の月を完全に置き換える」で対応
+
+## ホスティング（Render）
+
+- URL: https://kakei-dashboard-gxt4.onrender.com
+- Googleログイン（`st.login` / OIDC）→ メールアドレスを許可リストと照合して表示を出し分け
+  - `FULL_USERS` に一致 → 全タブ
+  - `SETTLE_USERS` に一致 → 清算ビューのみ
+  - どちらでもない → 「閲覧権限がありません」で `st.stop()`（**中身を一切描画しない**）
+- Secrets に `[auth]` が無い環境では、従来の `VIEW` 方式にフォールバックする実装になっている
+- 無料枠のため15分でスリープ。復帰に約1分（仕様）
+- 依存に `Authlib` と **`httpx`** が必要（httpxはAuthlibの依存に含まれないので明示が必須）
+
+### 経緯（同じ失敗を繰り返さないため）
+- Streamlit Community Cloudは**非公開アプリが1つまで**で、有料プランも存在しない
+- Community Cloudでは `st.user` が空になり、メールでの出し分けが**できない**（1.42以降の仕様）
+- そのためRenderへ移行し、`st.login` によるOIDC認証で出し分けを実現した
+- Google OAuthは「テスト中」のままでよい。スコープを既定（openid/email/profile）から
+  **増やさなければ**7日でトークンが切れる制限の対象外になる。スコープを追加しないこと
+
+## 集計ルール（変更時は影響範囲に注意）
+
+- 有効な取引 = `計算対象=1` かつ `振替≠1`
+- **経常ベース**トグル（既定ON）: 大項目「特別な支出」と収入の中項目「不動産所得」を除外
+- **割り勘相殺**トグル（既定OFF）: 中項目「割り勘代」の入金を支出の戻しとして扱う（KPIのみ）
+- 固定費の定義は画面から変更可（`data/settings.json` に保存）
+
+### 清算タブ（夫婦の生活費清算）
+Excelで手計算していたものを自動化したもの。設定は `data/settlement.json` に保存。
+- ① 家賃: 中項目「ローン返済」「管理費・積立金」を自動集計 ＋ 相手のローン負担（手入力）
+  → **2:1** で按分。ローン負担額は元利均等返済で毎月同額のため、
+  設定の `wife_loan_default` を全月に自動適用（月ごとの個別入力があればそちらが優先）
+- ② 固定費: 水道代・電気代・割り勘（食料品）・割り勘（日用品）を **折半** ＋ 手入力行
+- ③ 特殊費用: 相手名義の中項目は**全額相手負担**（`計算対象=0` の明細も含めて集計する点に注意）、
+  「その他（割り勘）」「旅行（割り勘）」は折半 ＋ 手入力行
+- ④ 請求額 = 相手の負担合計 − 相手のローン直接支払分（**円未満切り捨て**）
+- 各ブロックに「▼対象明細を見る」の折りたたみがあり、全数字が明細まで遡れる
+
+## UI実装で踏んだ地雷
+
+- **Streamlit標準の `st.dataframe` はCanvas描画**のため、CSSでもJavaScriptでも文字揃えを変えられない。
+  数値の右揃えのために `html_table()` という自前のHTMLテーブル描画関数を用意してある。
+  表を追加するときは `st.dataframe` ではなく **`html_table()` を使うこと**（編集が必要な
+  手入力欄だけは `st.data_editor` のまま）
+- `html_table()` は列の中身を見て「数値が6割以上の列」を自動判定して右揃えにする
+- 清算タブの金額表示は `fyen_x()`（切り捨て・整数）、その他は `fyen()` を使う
+- `st.components.v1.html` は非推奨。使うなら `st.iframe`（ただし height=0 は不可）
+
+## 運用
+
+- 起動: `start_dashboard.bat`（= `python -m streamlit run app.py`）。仮想環境は使っていない
+- クラウド反映: `update_cloud_data.bat` をダブルクリック（何度でも可）
+- 反映確認: クラウド側は5分キャッシュ。急ぐならサイドバーの「🔄 最新データを取得」
+- 定期作業: GitHubトークンが60日で切れるので、再発行してRenderのSecret Fileを更新
+- 鍵類は Bitwarden に「家計ダッシュボード Secrets」として保管済み
+
+## 開発時の作法
+
+- 変更後は必ず動作確認する。最低限、月モードと年モードの両方で起動できること
+- 清算タブを触ったら、金額が Excel 由来の想定値と合うか検算する
+- 新機能はまずローカル版（app.py）で確認 → 必要ならクラウド版へ移植、の順が安全
