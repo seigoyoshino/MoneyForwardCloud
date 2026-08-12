@@ -26,7 +26,7 @@ SUBTLE = "#626264"
 PAPER = "#F8F8FB"
 LINE = "#E0E0E3"
 GREEN_1200, GREEN_900, GREEN_600 = "#032213", "#115A36", "#259D63"
-GREEN_400, GREEN_200 = "#51B883", "#9BD4B5"
+GREEN_400, GREEN_200, GREEN_50 = "#51B883", "#9BD4B5", "#E6F5EC"
 CYAN_800, CYAN_600, CYAN_400 = "#006F83", "#00A3BF", "#2BC8E4"
 GRAY_800, GRAY_600, GRAY_400, GRAY_200 = "#333333", "#666666", "#999999", "#CCCCCC"
 SUCCESS, ERROR = "#197A4B", "#CE0000"
@@ -316,6 +316,7 @@ def show_settle_table(rows, partner_name: str = "", **kw):
 
 # ---------- 清算（閲覧専用） ----------
 def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
+    from html import escape as esc
     NM_ME, NM_PT = display_names()
     cfg = settle.get("config", {})
     mons = settle.get("months", {})
@@ -354,53 +355,64 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                 return float(r[k])
         return 0.0
 
-    def manual_view(rows: list) -> tuple[float, float]:
-        me_sum = sum(_me_val(r) for r in rows)
-        wf_sum = sum(_pt_val(r) for r in rows)
-        if rows:
-            # メモは直下の「📝 メモ全文」に全文が出るので、狭い画面を圧迫する列は持たせない
-            show_settle_table(pd.DataFrame([{
-                "項目": r.get("項目", ""), NM_ME: fyen(_me_val(r)),
-                NM_PT: fyen(_pt_val(r)),
-            } for r in rows]), NM_PT)
-            memos = [r for r in rows if str(r.get("メモ", "")).strip()]
-            if memos:
-                from html import escape
-                items = "".join(
-                    f"<div style='margin:3px 0'><b>{escape(str(r.get('項目') or '（項目名なし）'))}</b>："
-                    f"{escape(str(r.get('メモ'))).replace(chr(10), '<br>')}</div>" for r in memos)
-                st.markdown(
-                    f"<div style='font-size:12px;color:{SUBTLE};background:#FFFFFF;"
-                    f"border:1px solid {LINE};border-radius:6px;padding:8px 12px;"
-                    f"margin:4px 0 8px'>📝 メモ全文<br>{items}</div>", unsafe_allow_html=True)
-        return me_sum, wf_sum
+    def manual_sums(rows: list) -> tuple[float, float]:
+        """手入力行の合計。結論を先に描くため、描画とは切り離して先に計算する。"""
+        return sum(_me_val(r) for r in rows), sum(_pt_val(r) for r in rows)
 
-    # ① 家賃
-    st.subheader(f"① 家賃（{NM_ME}{r_me} : {NM_PT}{r_wf}）")
+    def manual_table(rows: list) -> None:
+        """手入力行の表とメモを描く（金額は manual_sums 側で計算済み）。"""
+        if not rows:
+            return
+        st.markdown("**手で追加した項目**")
+        # メモは直下の「📝 メモ全文」に全文が出るので、狭い画面を圧迫する列は持たせない
+        show_settle_table(pd.DataFrame([{
+            "項目": r.get("項目", ""), NM_ME: fyen(_me_val(r)),
+            NM_PT: fyen(_pt_val(r)),
+        } for r in rows]), NM_PT)
+        memos = [r for r in rows if str(r.get("メモ", "")).strip()]
+        if memos:
+            items = "".join(
+                f"<div style='margin:3px 0'><b>{esc(str(r.get('項目') or '（項目名なし）'))}</b>："
+                f"{esc(str(r.get('メモ'))).replace(chr(10), '<br>')}</div>" for r in memos)
+            st.markdown(
+                f"<div style='font-size:12px;color:{SUBTLE};background:#FFFFFF;"
+                f"border:1px solid {LINE};border-radius:6px;padding:8px 12px;"
+                f"margin:4px 0 8px'>📝 メモ全文<br>{items}</div>", unsafe_allow_html=True)
+
+    def landing(v: float) -> None:
+        """この項目のうちいくらが請求額に流れたかを示す締めの1行。"""
+        st.markdown(
+            f"<div class='settle-land'>→ このうち <b>{fyen_x(v)}</b> が{esc(NM_PT)}の負担として、"
+            "上の「この金額の内訳」に入っています</div>", unsafe_allow_html=True)
+
+    def detail_rows(subs, note_excluded: bool) -> list:
+        """費目ごとに明細＋小計を並べた行を作る。"""
+        tgt = mrows[mrows["sub"].isin(list(subs))].sort_values(["sub", "date"])
+        out = []
+        for s in subs:
+            g = tgt[tgt["sub"] == s]
+            if g.empty:
+                continue
+            for r in g.itertuples():
+                mark = "" if (r.calc == 1 or not note_excluded) else "（家計簿の集計対象外）"
+                out.append({"費目": r.sub, "日付": r.date, "内容": r.content + mark,
+                            "金額": fyen(-r.amount)})
+            out.append({"費目": f"── {s} 小計", "日付": "", "内容": "",
+                        "金額": fyen_x(-g["amount"].sum())})
+        return out
+
+    # ============================================================
+    # 集計（描画より先にすべて計算する。結論を画面の先頭に出すため）
+    # ============================================================
+    # ① 住まいの費用
     rent_rows = mrows[(mrows["sub"].isin(rent_subs)) & (mrows["calc"] == 1)
                       & (mrows["transfer"] != 1) & (mrows["amount"] < 0)]
     rent_mf = -rent_rows["amount"].sum()
     rent_total = rent_mf + wife_loan
     rent_me_amt = rent_total * r_share
     rent_wf_amt = rent_total - rent_me_amt
-    # 1行の長文はスマホで2行に折り返り、肝心の負担額が文中に埋もれるため表にする
-    show_settle_table([
-        {"項目": "MF側の家賃・管理費", "金額": fyen(rent_mf)},
-        {"項目": f"＋ {NM_PT}のローン負担", "金額": fyen(wife_loan)},
-        {"項目": "＝ 家賃合計", "金額": fyen_x(rent_total)},
-        {"項目": f"→ {NM_ME}の負担", "金額": fyen_x(rent_me_amt)},
-        {"項目": f"→ {NM_PT}の負担", "金額": fyen_x(rent_wf_amt)},
-    ], NM_PT)
-    with st.expander("▼ 家賃の対象明細を見る"):
-        rows_view = [{"日付": r.date, "内容": r.content, "中項目": r.sub, "金額": fyen(-r.amount)}
-                     for r in rent_rows.sort_values("date").itertuples()]
-        rows_view.append({"日付": "—", "内容": f"{NM_PT}のローン負担（手入力）", "中項目": "—",
-                          "金額": fyen(wife_loan)})
-        rows_view.append({"日付": "", "内容": "合計", "中項目": "", "金額": fyen_x(rent_total)})
-        show_settle_table(rows_view, NM_PT)
 
-    # ② 固定費
-    st.subheader(f"② 固定費（折半 {NM_ME}{s_me} : {NM_PT}{s_wf}）")
+    # ② 毎月の生活費
     fx_view, fx_auto_me, fx_auto_wf = [], 0.0, 0.0
     for s in fx_subs:
         amt = -mrows.loc[mrows["sub"] == s, "amount"].sum()
@@ -409,33 +421,14 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                         NM_PT: fyen_x(amt - me)})
         fx_auto_me += me
         fx_auto_wf += amt - me
-    show_settle_table(fx_view, NM_PT)
-    with st.expander("▼ 固定費の対象明細を見る"):
-        fxd = mrows[mrows["sub"].isin(fx_subs)].sort_values(["sub", "date"])
-        if fxd.empty:
-            st.caption("対象明細はありません。")
-        else:
-            rows_view = []
-            for s in fx_subs:
-                g = fxd[fxd["sub"] == s]
-                if g.empty:
-                    continue
-                for r in g.itertuples():
-                    rows_view.append({"中項目": r.sub, "日付": r.date, "内容": r.content,
-                                      "金額": fyen(-r.amount)})
-                rows_view.append({"中項目": f"── {s} 小計", "日付": "", "内容": "",
-                                  "金額": fyen_x(-g["amount"].sum())})
-            show_settle_table(rows_view, NM_PT)
-    st.markdown("**手入力の追加項目**")
-    fx_man_me, fx_man_wf = manual_view(rec.get("fixed_manual", []))
+    fx_manual = rec.get("fixed_manual", [])
+    fx_man_me, fx_man_wf = manual_sums(fx_manual)
     fx_me = fx_auto_me + fx_man_me
     fx_wf = fx_auto_wf + fx_man_wf
-    st.caption(f"固定費 小計 → {NM_ME} {fyen_x(fx_me)} ／ {NM_PT} {fyen_x(fx_wf)}")
 
-    # ③ 特殊費用
-    st.subheader("③ 特殊費用（計算対象外の明細も含む）")
+    # ③ 今月だけの費用
     # 「割合」を独立した列に持つと5列になり、スマホでは1セルが3〜4行に折り返って崩れる。
-    # 全額負担の行だけ項目名に添え、②固定費と同じ4列に揃える（折半比率は下のcaptionに出す）。
+    # 全額負担の行だけ項目名に添え、②と同じ4列に揃える。
     sp_view = []
     sp_full_wf = sp_split_me = sp_split_wf = 0.0
     for s in sp_full:
@@ -450,65 +443,113 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
                         NM_ME: fyen_x(me), NM_PT: fyen_x(amt - me)})
         sp_split_me += me
         sp_split_wf += amt - me
-    show_settle_table(sp_view, NM_PT)
-    if sp_split:
-        st.caption(f"「（全額{NM_PT}）」以外は折半 {NM_ME}{s_me} : {NM_PT}{s_wf}")
-    with st.expander("▼ 特殊費用の対象明細を見る"):
-        tgt = mrows[mrows["sub"].isin(list(sp_full) + list(sp_split))].sort_values(["sub", "date"])
-        if tgt.empty:
-            st.caption("対象明細はありません。")
-        else:
-            rows_view = []
-            for s in list(sp_full) + list(sp_split):
-                g = tgt[tgt["sub"] == s]
-                if g.empty:
-                    continue
-                # 「計算対象」列を独立させると5列で崩れるので、対象外の行だけ内容に注記する
-                for r in g.itertuples():
-                    rows_view.append({"中項目": r.sub, "日付": r.date,
-                                      "内容": r.content + ("" if r.calc == 1 else "（計算対象外）"),
-                                      "金額": fyen(-r.amount)})
-                rows_view.append({"中項目": f"── {s} 小計", "日付": "", "内容": "",
-                                  "金額": fyen_x(-g["amount"].sum())})
-            show_settle_table(rows_view, NM_PT)
-    st.markdown("**手入力の追加項目**")
-    sp_man_me, sp_man_wf = manual_view(rec.get("special_manual", []))
+    sp_manual = rec.get("special_manual", [])
+    sp_man_me, sp_man_wf = manual_sums(sp_manual)
     sp_me_amt = sp_split_me + sp_man_me
     sp_wf_amt = sp_full_wf + sp_split_wf + sp_man_wf
-    st.caption(f"特殊費用 小計 → {NM_ME} {fyen_x(sp_me_amt)} ／ {NM_PT} {fyen_x(sp_wf_amt)}")
 
-    # ④ 清算結果
-    st.subheader("④ 清算結果")
     total_me = rent_me_amt + fx_me + sp_me_amt
     total_wf = rent_wf_amt + fx_wf + sp_wf_amt
     billed = total_wf - wife_loan
     billed_floor = int(math.floor(billed))
-    k1, k2 = st.columns(2)
-    k1.metric(f"💰 請求額（{NM_PT}へ・円未満切捨て）", fyen(billed_floor))
-    k2.metric(f"{NM_PT}の負担合計", fyen_x(total_wf))
-    k3, k4 = st.columns(2)
-    k3.metric(f"{NM_PT}ローン直接支払分（差引）", fyen(wife_loan))
-    k4.metric(f"（参考）{NM_ME}の負担合計", fyen_x(total_me))
-    if billed < 0:
-        st.info(f"マイナスのため、{NM_ME}から {fyen(abs(billed_floor))} を支払う清算になります。")
 
-    bd_rows = [(f"家賃（{NM_PT}の負担分）", rent_wf_amt),
-               ("固定費（折半・自動集計）", fx_auto_wf), ("固定費（手入力）", fx_man_wf),
-               ("特殊費用（全額負担分）", sp_full_wf), ("特殊費用（折半分）", sp_split_wf),
-               ("特殊費用（手入力）", sp_man_wf)]
-    td = "padding:1px 18px 1px 0;color:" + SUBTLE
-    tdr = "text-align:right;font-variant-numeric:tabular-nums;padding:1px 0"
-    lines = "".join(f"<tr><td style='{td}'>{n}</td><td style='{tdr}'>{fyen_x(v)}</td></tr>"
-                    for n, v in bd_rows if v != 0)
-    border = f"border-top:1px solid {LINE}"
-    lines += (f"<tr><td style='{td};{border}'>{NM_PT}の負担合計</td>"
-              f"<td style='{tdr};{border}'><b>{fyen_x(total_wf)}</b></td></tr>"
-              f"<tr><td style='{td}'>− {NM_PT}ローン直接支払分</td><td style='{tdr}'>−{fyen(wife_loan)}</td></tr>"
-              f"<tr><td style='{td};{border}'>＝ 請求額（切捨て）</td>"
-              f"<td style='{tdr};{border}'><b>{fyen(billed_floor)}</b></td></tr>")
-    st.markdown(f"<div style='font-size:12px;margin-top:4px'>請求額の内訳"
-                f"<table style='font-size:12px;border-collapse:collapse;margin-top:2px'>{lines}</table></div>",
+    # ============================================================
+    # 描画
+    # ============================================================
+    # ---- 結論（この画面の主役）----
+    if billed >= 0:
+        cap = f"{month_label(s_month)} の {NM_PT} へのご請求"
+        amt_txt = fyen(billed_floor)
+        if wife_loan > 0:
+            sub = (f"{NM_PT}の負担 {fyen_x(total_wf)} のうち、住宅ローンとして直接"
+                   f"支払い済みの {fyen(wife_loan)} を差し引いた金額です。")
+        else:
+            sub = f"{NM_PT}の負担の合計です。"
+    else:
+        cap = f"{month_label(s_month)} は {NM_ME} から {NM_PT} へお支払い"
+        amt_txt = fyen(abs(billed_floor))
+        sub = (f"{NM_PT}の負担 {fyen_x(total_wf)} より、直接支払い済みの "
+               f"{fyen(wife_loan)} の方が多いため、差額をお返しします。")
+    st.markdown(f"<div class='settle-hero'><div class='cap'>{esc(cap)}</div>"
+                f"<div class='amt'>{esc(amt_txt)}</div>"
+                f"<div class='sub'>{esc(sub)}</div></div>", unsafe_allow_html=True)
+
+    # ---- ①②③ が請求額に積み上がる流れ ----
+    st.markdown("##### この金額の内訳")
+    steps = [("①", "住まいの費用", rent_wf_amt),
+             ("②", "毎月の生活費", fx_wf),
+             ("③", "今月だけの費用", sp_wf_amt)]
+    lines = "".join(
+        f"<tr class='step'><td><span class='sflow-idx'>{i}</span> {esc(n)}</td>"
+        f"<td class='n'>{fyen_x(v)}</td></tr>" for i, n, v in steps)
+    lines += (f"<tr class='sum'><td>{esc(NM_PT)}の負担 合計</td>"
+              f"<td class='n'>{fyen_x(total_wf)}</td></tr>")
+    if wife_loan > 0:
+        lines += (f"<tr class='minus'><td>− 直接支払い済み（住宅ローン）</td>"
+                  f"<td class='n'>−{fyen(wife_loan)}</td></tr>")
+    final_label = ("お支払いいただく金額" if billed >= 0
+                   else f"{NM_ME} からお返しする金額")
+    lines += (f"<tr class='final'><td>{esc(final_label)}</td>"
+              f"<td class='n'>{fyen(abs(billed_floor))}</td></tr>")
+    st.markdown(f"<div style='border:1px solid {LINE};border-radius:8px;overflow:hidden;"
+                f"margin:2px 0 12px'><table class='sflow'>{lines}</table></div>",
                 unsafe_allow_html=True)
+    st.caption("下の項目をタップすると、それぞれの中身を確認できます。")
+
+    # ---- ① 住まいの費用 ----
+    with st.expander(f"① 住まいの費用　{NM_PT}の負担 {fyen_x(rent_wf_amt)}"):
+        st.caption(f"住宅ローンと管理費を {NM_ME} {r_me} : {NM_PT} {r_wf} で分けています。")
+        show_settle_table([
+            {"項目": f"{NM_ME}が払った住宅ローン・管理費", "金額": fyen(rent_mf)},
+            {"項目": f"＋ {NM_PT}が直接払った住宅ローン", "金額": fyen(wife_loan)},
+            {"項目": "＝ 住まいの費用 合計", "金額": fyen_x(rent_total)},
+            {"項目": f"→ {NM_ME}の負担（{r_me}）", "金額": fyen_x(rent_me_amt)},
+            {"項目": f"→ {NM_PT}の負担（{r_wf}）", "金額": fyen_x(rent_wf_amt)},
+        ], NM_PT)
+        with st.expander("対象になった明細を見る"):
+            rows_view = [{"日付": r.date, "内容": r.content, "費目": r.sub,
+                          "金額": fyen(-r.amount)}
+                         for r in rent_rows.sort_values("date").itertuples()]
+            rows_view.append({"日付": "—", "内容": f"{NM_PT}が直接払った住宅ローン",
+                              "費目": "—", "金額": fyen(wife_loan)})
+            rows_view.append({"日付": "", "内容": "合計", "費目": "",
+                              "金額": fyen_x(rent_total)})
+            show_settle_table(rows_view, NM_PT)
+        landing(rent_wf_amt)
+
+    # ---- ② 毎月の生活費 ----
+    with st.expander(f"② 毎月の生活費　{NM_PT}の負担 {fyen_x(fx_wf)}"):
+        half = "半分ずつ" if s_me == s_wf else f"{NM_ME} {s_me} : {NM_PT} {s_wf}"
+        st.caption(f"毎月かかる生活費を {half} で分けています。")
+        show_settle_table(fx_view, NM_PT)
+        with st.expander("対象になった明細を見る"):
+            rows_view = detail_rows(fx_subs, note_excluded=False)
+            if rows_view:
+                show_settle_table(rows_view, NM_PT)
+            else:
+                st.caption("対象の明細はありません。")
+        manual_table(fx_manual)
+        landing(fx_wf)
+
+    # ---- ③ 今月だけの費用 ----
+    with st.expander(f"③ 今月だけの費用　{NM_PT}の負担 {fyen_x(sp_wf_amt)}"):
+        note = f"「（全額{NM_PT}）」は全額{NM_PT}の負担です。"
+        if sp_split:
+            half = "半分ずつ" if s_me == s_wf else f"{NM_ME} {s_me} : {NM_PT} {s_wf}"
+            note += f"それ以外は {half} で分けています。"
+        st.caption(note)
+        show_settle_table(sp_view, NM_PT)
+        with st.expander("対象になった明細を見る"):
+            rows_view = detail_rows(list(sp_full) + list(sp_split), note_excluded=True)
+            if rows_view:
+                show_settle_table(rows_view, NM_PT)
+            else:
+                st.caption("対象の明細はありません。")
+        manual_table(sp_manual)
+        landing(sp_wf_amt)
+
+    # ---- 参考情報 ----
+    st.caption(f"（参考）{NM_ME}の負担合計 {fyen_x(total_me)}")
 
     ny, nm = int(s_month[:4]), int(s_month[5:7]) + 1
     nxt = f"{ny + (nm > 12)}-{str(nm if nm <= 12 else 1).zfill(2)}"
@@ -536,6 +577,28 @@ st.markdown(f"""<style>
   table.ntab tr:last-child td {{ border-bottom: none; }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
+  /* 清算ビューの結論カード。st.metric では値の文字サイズを変えられないため自前で描く */
+  .settle-hero {{ background:{GREEN_50}; border:1px solid {GREEN_900};
+      border-radius:12px; padding:16px 18px; margin:6px 0 18px; }}
+  .settle-hero .cap {{ font-size:12px; color:{GREEN_900}; font-weight:600;
+      letter-spacing:.02em; }}
+  .settle-hero .amt {{ font-size:40px; font-weight:700; color:{GREEN_1200};
+      line-height:1.1; font-variant-numeric:tabular-nums; margin:4px 0 6px; }}
+  .settle-hero .sub {{ font-size:12px; color:{SUBTLE}; line-height:1.6; }}
+  /* ①②③ が請求額に積み上がる流れを示す表 */
+  table.sflow {{ width:100%; border-collapse:collapse; font-size:13px;
+      font-variant-numeric:tabular-nums; background:#FFFFFF; }}
+  table.sflow td {{ padding:9px 12px; }}
+  table.sflow td.n {{ text-align:right; white-space:nowrap; }}
+  table.sflow tr.step td {{ border-bottom:1px solid #F0F0F2; }}
+  table.sflow tr.sum td {{ border-top:2px solid {GREEN_900}; font-weight:600; }}
+  table.sflow tr.minus td {{ color:{SUBTLE}; }}
+  table.sflow tr.final td {{ border-top:2px solid {GREEN_900}; font-weight:700;
+      background:{GREEN_50}; font-size:15px; }}
+  .sflow-idx {{ color:{GREEN_900}; font-weight:600; }}
+  .settle-land {{ background:#FFFFFF; border:1px dashed {GREEN_200};
+      border-radius:8px; padding:8px 12px; font-size:13px; margin:8px 0 2px; }}
+  .settle-land b {{ color:{GREEN_900}; }}
 </style>""", unsafe_allow_html=True)
 
 
