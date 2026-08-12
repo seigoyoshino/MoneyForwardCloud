@@ -497,9 +497,41 @@ def view_mode() -> str:
     return "settle" if v.startswith("s") else "full"
 
 
-role = view_mode()
+def auth_configured() -> bool:
+    """Secrets に [auth]（Google OIDC）が設定されているか。
+    設定あり → Render等でのGoogleログイン+許可リスト照合。
+    設定なし → 従来どおり Secrets の VIEW で表示を決める（Streamlit Cloud互換）。
+    """
+    try:
+        a = st.secrets.get("auth", None)
+        return bool(a) and "client_id" in a
+    except Exception:
+        return False
 
-if True:
+
+role = None
+if auth_configured():
+    if not st.user.is_logged_in:
+        st.title("🧾 家計ダッシュボード")
+        st.write("このアプリは非公開です。登録済みのGoogleアカウントでログインしてください。")
+        st.button("Googleでログイン", on_click=st.login, type="primary")
+        st.stop()
+    else:
+        _email = str(getattr(st.user, "email", "") or "").strip().lower()
+        if _email in emails_from_secret("FULL_USERS"):
+            role = "full"
+        elif _email in emails_from_secret("SETTLE_USERS"):
+            role = "settle"
+        else:
+            st.error(f"このアプリの閲覧権限がありません（{_email}）。")
+            st.button("ログアウト", on_click=st.logout)
+            st.stop()
+        if role:
+            st.session_state["_auth_email"] = _email
+else:
+    role = view_mode()
+
+if role:
     # ---- データ読込（非公開リポジトリから取得して復号）----
     def sec(name: str, default: str = "") -> str:
         try:
@@ -554,6 +586,9 @@ if True:
                 decrypt_bundle.clear()
                 st.rerun()
             st.sidebar.caption("清算ビュー" if role == "settle" else "全体ビュー")
+            if st.session_state.get("_auth_email"):
+                st.sidebar.caption(f"ログイン: {st.session_state['_auth_email']}")
+                st.sidebar.button("ログアウト", on_click=st.logout, width="stretch")
 
             # ================= 清算のみ =================
             if role == "settle":
