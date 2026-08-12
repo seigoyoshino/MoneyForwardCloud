@@ -178,6 +178,30 @@ def apply_scope(df: pd.DataFrame, exclude_special: bool) -> pd.DataFrame:
     return df[~drop_exp & ~drop_inc]
 
 
+# スマホでは月次の棒グラフを直近Nヶ月に絞る。400px幅では24ヶ月でバーが約7pxになり、
+# 値ラベルも潰れて判読できないため。
+CHART_MONTHS_MOBILE = 12
+
+
+def is_mobile() -> bool:
+    """スマホからのアクセスかを User-Agent で判定する。
+    Streamlit にビューポート幅を取る手段がないための代替で、幅そのものではない。
+    そのため画面回転やPCの細いウィンドウには追随しない。
+    """
+    try:
+        ua = str(st.context.headers.get("User-Agent", ""))
+    except Exception:
+        return False
+    return any(k in ua for k in ("Mobile", "Android", "iPhone", "iPad"))
+
+
+def chart_window(month_list: list[str], mobile: bool) -> list[str]:
+    """棒グラフに載せる月を絞る（スマホのみ）。集計そのものには影響しない。"""
+    if mobile and len(month_list) > CHART_MONTHS_MOBILE:
+        return month_list[-CHART_MONTHS_MOBILE:]
+    return month_list
+
+
 def filled_months(months: list[str]) -> list[str]:
     if not months:
         return []
@@ -611,6 +635,9 @@ if role:
             months = sorted(valid["month"].unique().tolist())
             all_months = filled_months(months)
             years = sorted({m[:4] for m in months})
+            IS_MOBILE = is_mobile()
+            # 棒グラフの横軸に載せる月（スマホは直近12ヶ月）。KPIや表は全期間のまま。
+            chart_months = chart_window(all_months, IS_MOBILE)
             settle = bundle.get("settlement", {})
             settings = bundle.get("settings", {})
 
@@ -635,15 +662,18 @@ if role:
 
             # ================= フル表示 =================
             else:
-                st.sidebar.divider()
-                mode = st.sidebar.radio("期間", ["月", "年", "全期間"], horizontal=True)
+                st.title("家計ダッシュボード")
+                # スマホではサイドバーが既定で折りたたまれるため、切替頻度の高い期間の
+                # 選択は本文に置く（清算ビューの「清算対象月」と同じ扱い）。
+                pc1, pc2 = st.columns([1, 1])
+                mode = pc1.radio("期間", ["月", "年", "全期間"], horizontal=True)
                 sel_month = sel_year = None
                 if mode == "月" and months:
-                    sel_month = st.sidebar.selectbox("対象月", list(reversed(months)),
-                                                     format_func=month_label)
+                    sel_month = pc2.selectbox("対象月", list(reversed(months)),
+                                              format_func=month_label)
                 elif mode == "年" and years:
-                    sel_year = st.sidebar.selectbox("対象年", list(reversed(years)),
-                                                    format_func=lambda y: f"{y}年")
+                    sel_year = pc2.selectbox("対象年", list(reversed(years)),
+                                             format_func=lambda y: f"{y}年")
                 st.sidebar.divider()
                 exclude_special = st.sidebar.checkbox("経常ベース（特別・臨時を除く）", value=True)
                 net_warikan = st.sidebar.checkbox("割り勘を支出と相殺", value=False)
@@ -667,7 +697,6 @@ if role:
                         prev = summarize(scoped_all[scoped_all["month"] == all_months[i - 1]],
                                          net_warikan)
 
-                st.title("家計ダッシュボード")
                 st.caption(f"表示期間: **{period_label}** ／ {'経常ベース' if exclude_special else '全体'}"
                            + ("・割り勘相殺" if net_warikan else ""))
                 c1, c2 = st.columns(2)
@@ -688,7 +717,7 @@ if role:
 
                 monthly = []
                 grouped = dict(tuple(scoped_all.groupby("month")))
-                for m in all_months:
+                for m in chart_months:
                     s = summarize(grouped.get(m, scoped_all.iloc[0:0]), net_warikan)
                     monthly.append({"label": m[2:].replace("-", "/"), "収入": s["income"],
                                     "支出": s["expense"], "収支": s["balance"]})
@@ -711,9 +740,10 @@ if role:
                     many = len(trend) > 8
                     fig = go.Figure()
                     for name, col in [("収入", INDIGO), ("支出", SHU)]:
+                        # スマホは1本あたりが細く、値ラベルを載せても潰れるだけなので出さない
                         fig.add_bar(x=trend["label"], y=trend[name], name=name, marker_color=col,
                                     hovertemplate=HOVER_YEN,
-                                    text=[man_label(v) for v in trend[name]],
+                                    text=None if IS_MOBILE else [man_label(v) for v in trend[name]],
                                     textposition="outside", textangle=-90 if many else 0,
                                     textfont=dict(size=9, color=SUBTLE), cliponaxis=False)
                     fig.add_scatter(x=trend["label"], y=trend["収支"], name="収支",
@@ -723,6 +753,9 @@ if role:
                     if peak > 0:
                         fig.update_yaxes(range=[min(0, trend["収支"].min() * 1.1), peak * 1.22])
                     st.plotly_chart(base_layout(fig), width="stretch", config=PLOTLY_CONFIG)
+                    if mode != "年" and len(chart_months) < len(all_months):
+                        st.caption(f"グラフは直近{len(chart_months)}ヶ月を表示しています"
+                                   "（スマホ表示・上のKPIと下の表は選んだ期間のままです）。")
 
                     exp = period[period["amount"] < 0]
                     cat_sum = (-exp.groupby("cat")["amount"].sum()).sort_values(ascending=False)
@@ -764,12 +797,12 @@ if role:
                                                format_func=lambda c: f"{c}　{fyen(cat_sum[c])}")
                         series = (-scoped_all[(scoped_all["amount"] < 0)
                                               & (scoped_all["cat"] == sel_cat)]
-                                  .groupby("month")["amount"].sum()).reindex(all_months).fillna(0)
+                                  .groupby("month")["amount"].sum()).reindex(chart_months).fillna(0)
                         many = len(series) > 8
                         fig = go.Figure(go.Bar(
                             x=[m[2:].replace("-", "/") for m in series.index], y=series.values,
                             marker_color=cat_color(sel_cat), hovertemplate=HOVER_YEN, name=sel_cat,
-                            text=[man_label(v) for v in series.values],
+                            text=None if IS_MOBILE else [man_label(v) for v in series.values],
                             textposition="outside", textangle=-90 if many else 0,
                             textfont=dict(size=9, color=SUBTLE), cliponaxis=False))
                         fig.add_hline(y=series.mean(), line_dash="dash", line_color=SUBTLE,
@@ -830,7 +863,7 @@ if role:
                     pv["kind"] = "変動費"
                     pv.loc[pv["cat"].isin(f_cats) | pv["sub"].isin(f_subs), "kind"] = "固定費"
                     pivot = (-pv.pivot_table(index="month", columns="kind", values="amount",
-                                             aggfunc="sum")).reindex(all_months).fillna(0)
+                                             aggfunc="sum")).reindex(chart_months).fillna(0)
                     fig = go.Figure()
                     many = len(pivot) > 8
                     for k_name, color, tcolor in [("固定費", GREEN_900, "#FFFFFF"),
@@ -839,7 +872,7 @@ if role:
                             fig.add_bar(x=[m[2:].replace("-", "/") for m in pivot.index],
                                         y=pivot[k_name], name=k_name, marker_color=color,
                                         hovertemplate=HOVER_YEN,
-                                        text=[man_label(v) for v in pivot[k_name]],
+                                        text=None if IS_MOBILE else [man_label(v) for v in pivot[k_name]],
                                         textposition="inside", insidetextanchor="middle",
                                         textangle=-90 if many else 0,
                                         textfont=dict(size=9, color=tcolor))
