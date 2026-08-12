@@ -22,7 +22,9 @@ Streamlit製。ローカル版とクラウド版（閲覧専用）の2本立て�
 | `C:\Users\seigo\Git\MoneyForwardDashboard` | seigoyoshino/MoneyForwardDashboard | **非公開** | ローカル版 `app.py`、データ、暗号化済み `cloud_data/bundle.enc` |
 | `C:\Users\seigo\Git\MoneyForwardCloud` | seigoyoshino/MoneyForwardCloud | 公開 | クラウド版 `cloud_app.py`、`requirements.txt` のみ（データなし） |
 
-`cloud_app.py` の編集後は MoneyForwardCloud 側にコピーして push する。
+`cloud_app.py` を編集したら、MoneyForwardCloud リポジトリ側で直接同じ変更を加えて push する
+（コードの同期を自動化する仕組みはない。`update_cloud_data.bat` は後述のとおり
+`data/` のデータをマスク＋暗号化して非公開リポジトリに push するだけで、コードは扱わない）。
 （`settle_app.py` はStreamlit Cloud時代の名残。Render移行後は未使用）
 
 ## データの流れ
