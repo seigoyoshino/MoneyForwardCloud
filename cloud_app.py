@@ -82,6 +82,50 @@ def month_label(m: str) -> str:
 
 HOVER_YEN = "%{y:,.0f}円<extra>%{fullData.name}</extra>"
 
+def html_table(df, height: int | None = None, **_ignored):
+    """数値列を右揃えにした自前HTMLテーブルを描画する。
+    Streamlit標準の表はCanvasに描画されるため文字揃えを変更できず、代わりにこれを使う。
+    """
+    import re as _re
+    from html import escape
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
+    if df.empty:
+        st.caption("表示する行がありません。")
+        return
+    num_re = _re.compile(r"^[+\-−]?[¥￥]?[\d,]+(\.\d+)?\s*(%|pt|円|件)?(（.*）)?$")
+
+    def _is_num_col(col) -> bool:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            return True
+        vals = [str(v).strip() for v in df[col]
+                if str(v).strip() not in ("", "—", "-", "nan", "None")]
+        if not vals:
+            return False
+        return sum(1 for v in vals if num_re.match(v)) / len(vals) >= 0.6
+
+    right = {c for c in df.columns if _is_num_col(c)}
+    head = "".join(
+        f"<th style='text-align:{'right' if c in right else 'left'}'>{escape(str(c))}</th>"
+        for c in df.columns)
+    body = []
+    for _, r in df.iterrows():
+        tds = []
+        for c in df.columns:
+            v = "" if pd.isna(r[c]) else str(r[c])
+            al = "right" if c in right else "left"
+            tds.append(f"<td style='text-align:{al}'>{escape(v)}</td>")
+        body.append("<tr>" + "".join(tds) + "</tr>")
+    box = f"max-height:{height}px;overflow-y:auto;" if height else ""
+    st.markdown(
+        f"<div style='{box}overflow-x:auto;border:1px solid {LINE};border-radius:8px;"
+        f"background:#FFFFFF;margin:2px 0 10px'>"
+        f"<table class='ntab'><thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table></div>",
+        unsafe_allow_html=True)
+
+
+
 
 def base_layout(fig: go.Figure, height=320) -> go.Figure:
     fig.update_layout(
@@ -228,7 +272,7 @@ def emails_from_secret(name: str) -> set[str]:
 def show_settle_table(rows, partner_name: str = "", **kw):
     """清算ビューの表を描画する（数値列の右揃えはグローバルCSS/JSで適用）。"""
     df = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
-    st.dataframe(df, width="stretch", hide_index=True, **kw)
+    html_table(df, **kw)
 
 
 # ---------- 清算（閲覧専用） ----------
@@ -420,57 +464,21 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
 st.set_page_config(page_title="家計ダッシュボード", page_icon="🧾", layout="wide")
 st.markdown(f"""<style>
   [data-testid="stMetricValue"] {{ font-variant-numeric: tabular-nums; }}
-  [data-testid="stDataFrame"] [role="gridcell"][data-num="1"],
-  [data-testid="stDataFrame"] [role="columnheader"][data-num="1"] {{
-    text-align: right !important; justify-content: flex-end !important;
+  [data-testid="stMetricValue"], [data-testid="stMetricDelta"] {{
+    display: flex; justify-content: flex-end; text-align: right;
   }}
-  [data-testid="stDataFrame"] [role="gridcell"][data-num="1"] > *,
-  [data-testid="stDataFrame"] [role="columnheader"][data-num="1"] > * {{
-    text-align: right !important; width: 100%;
-  }}
-  [data-testid="stDataFrame"] {{ font-variant-numeric: tabular-nums; }}
+  table.ntab {{ width: 100%; border-collapse: collapse; font-size: 13px;
+    font-variant-numeric: tabular-nums; }}
+  table.ntab th {{ color: {SUBTLE}; font-weight: 500; font-size: 12px;
+    padding: 8px 12px; border-bottom: 1px solid {LINE};
+    background: #FFFFFF; position: sticky; top: 0; white-space: nowrap; }}
+  table.ntab td {{ padding: 7px 12px; border-bottom: 1px solid #F0F0F2;
+    vertical-align: top; }}
+  table.ntab tr:last-child td {{ border-bottom: none; }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
 </style>""", unsafe_allow_html=True)
 
-# 表の数値セルを検出して右揃えの印を付ける
-st.iframe(
-    r"""
-    <script>
-    const doc = window.parent.document;
-    const isNum = (t) => {
-      const s = (t || "").trim();
-      if (!s) return false;
-      return /^[+\-−]?[¥￥]?[\d,]+(\.\d+)?%?$/.test(s) || /^[+\-−]?[¥￥][\d,]+/.test(s);
-    };
-    const mark = () => {
-      doc.querySelectorAll('[data-testid="stDataFrame"]').forEach(tbl => {
-        const cells = tbl.querySelectorAll('[role="gridcell"]');
-        const numCols = {};
-        cells.forEach(c => {
-          const col = c.getAttribute('aria-colindex');
-          if (!col) return;
-          if (!(col in numCols)) numCols[col] = {n: 0, t: 0};
-          const txt = c.innerText;
-          if (txt && txt.trim()) { numCols[col].t++; if (isNum(txt)) numCols[col].n++; }
-        });
-        const right = new Set(Object.keys(numCols).filter(k => numCols[k].t > 0 && numCols[k].n / numCols[k].t >= 0.7));
-        cells.forEach(c => {
-          const col = c.getAttribute('aria-colindex');
-          if (right.has(col)) c.setAttribute('data-num', '1');
-        });
-        tbl.querySelectorAll('[role="columnheader"]').forEach(h => {
-          const col = h.getAttribute('aria-colindex');
-          if (right.has(col)) h.setAttribute('data-num', '1');
-        });
-      });
-    };
-    mark();
-    setInterval(mark, 700);
-    </script>
-    """,
-    height=1,
-)
 
 # ---- 認証 ----
 def view_mode() -> str:
@@ -669,11 +677,11 @@ if True:
                     st.subheader(f"支出トップ10（{period_label}）")
                     top10 = exp.nsmallest(10, "amount")
                     if not top10.empty:
-                        st.dataframe(pd.DataFrame({
+                        html_table(pd.DataFrame({
                             "日付": top10["date"], "内容": top10["content"],
                             "カテゴリ": top10["cat"] + " › " + top10["sub"],
                             "金額": top10["amount"].map(lambda a: fyen(-a)),
-                        }), width="stretch", hide_index=True)
+                        }))
 
                 # ---- カテゴリ ----
                 with tab_cat:
@@ -725,11 +733,11 @@ if True:
                             pool = pool[pool["sub"] == pick]
                         big = pool.nsmallest(30, "amount")
                         st.caption("金額の大きい明細（上位30件）")
-                        st.dataframe(pd.DataFrame({
+                        html_table(pd.DataFrame({
                             "日付": big["date"].str[5:], "内容": big["content"],
                             "中項目": big["sub"],
                             "金額": big["amount"].map(lambda a: fyen(-a)),
-                        }), width="stretch", hide_index=True)
+                        }))
 
                 # ---- 固定費・サブスク ----
                 with tab_fix:
@@ -778,12 +786,12 @@ if True:
                         g["直近の請求"] = latest_amt
                         g["月平均"] = g["累計"] / g["出現月数"]
                         g = g.sort_values("月平均", ascending=False).reset_index()
-                        st.dataframe(pd.DataFrame({
+                        html_table(pd.DataFrame({
                             "サービス": g["content"],
                             "直近の請求": g["直近の請求"].map(fyen),
                             "月平均": g["月平均"].map(fyen),
                             "出現月数": g["出現月数"], "累計": g["累計"].map(fyen),
-                        }), width="stretch", hide_index=True)
+                        }))
 
                 # ---- 清算 ----
                 with tab_settle:
@@ -807,10 +815,10 @@ if True:
                         base = base[hay.str.contains(q.strip().lower(), regex=False)]
                     base = base.sort_values("date", ascending=False)
                     st.caption(f"{len(base):,}件")
-                    st.dataframe(pd.DataFrame({
+                    html_table(pd.DataFrame({
                         "日付": base["date"], "内容": base["content"],
                         "カテゴリ": base["cat"] + " › " + base["sub"],
                         "金額": base["amount"].map(lambda a: ("+" if a > 0 else "−") + f"¥{abs(a):,.0f}"),
-                    }).head(300), width="stretch", hide_index=True, height=520)
+                    }).head(300), height=520)
                     if len(base) > 300:
                         st.caption("先頭300件を表示しています。検索で絞り込んでください。")
