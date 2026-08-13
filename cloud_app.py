@@ -213,6 +213,7 @@ BONUS_RE = r"賞与|ボーナス"
 BONUS_SUB = "賞与"
 LEVELED_CONTENT = "年次費用の月割り"
 SHARE_CONTENT = "相手が直接払っている分の自己負担"
+SYNTHETIC_ID_PREFIXES = ("__leveled__", "__share__")   # 実在しない合成明細の目印
 
 
 # 設定はバンドル（settings.json / settlement.json）から来る。
@@ -294,6 +295,39 @@ CONTENT_SUBS_DEFAULT = [
 def content_subs() -> list[dict]:
     v = load_settings().get("content_subs")
     return v if isinstance(v, list) and v else CONTENT_SUBS_DEFAULT
+
+
+def fixed_amounts() -> dict[str, float]:
+    """契約で決まっている月額（MFに出る実額）。基準線の推定より優先する。
+
+    基準線が短い間（住み替え直後など）、毎月同額のものまで推定に頼るのは弱い。
+    金額が分かっているものは、そのまま見込みに使う。
+    """
+    raw = load_settings().get("fixed_amounts", {})
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in raw.items():
+        try:
+            out[k] = float(v if not isinstance(v, dict) else v.get("amount"))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def expected_monthly(sub: str, amount: float) -> float:
+    """MFの実額を、ペース計算で使う「自分の負担」に換算する。
+
+    apply_settlement_share と同じ按分を、1つの金額に対して行うもの。
+    設定は MF に出る額のまま書けるようにして、按分は仕組み側で通す。
+    """
+    s = settle_shares()
+    if sub in s["rent_subs"]:
+        loan = s["wife_loan_default"] if sub == s["rent_subs"][0] else 0
+        return (amount + loan) * s["rent_share"]
+    if sub in s["split_subs"]:
+        return amount * s["split_share"]
+    return amount
 
 
 def split_by_content(df: pd.DataFrame) -> pd.DataFrame:
@@ -427,7 +461,10 @@ def pace_asof(df: pd.DataFrame, month: str, lag: int = CARD_LAG_DAYS,
     end = start + pd.Timedelta(days=dim - 1)
     today = pd.Timestamp(datetime.now(JST).date())
     exp = pd.to_datetime(exported_at, errors="coerce")
-    last = pd.to_datetime(df["date"], errors="coerce").max()
+    # 合成明細（年次費用の月割り・相手負担の按分）は実在しない行で、当月まだ
+    # 落ちていないローンの日付＝未来を持つことがある。データの新しさの根拠から外す
+    real = df[~df["id"].astype(str).str.startswith(SYNTHETIC_ID_PREFIXES)]
+    last = pd.to_datetime(real["date"], errors="coerce").max()
     if pd.notna(exp):
         last = min(last, exp.normalize()) if pd.notna(last) else exp.normalize()
     # 「信じられるデータの最終日」。遅延を引くのはここで、月末からではない
@@ -474,6 +511,9 @@ def build_baseline(df: pd.DataFrame, month: str, window: int = BASELINE_WINDOW,
             vals = [float(piv.loc[sub, m]) if m in piv.columns else 0.0 for m in ms]
             kind, value = _classify(vals)
             out[key][sub] = {"kind": kind, "value": value}
+    # 契約で決まっているものは推定を上書きする（基準線が短いときに効く）
+    for sub, amt in fixed_amounts().items():
+        out["exp"][sub] = {"kind": "fixed", "value": expected_monthly(sub, amt)}
     return out
 
 
@@ -491,7 +531,7 @@ def forecast_landing(df: pd.DataFrame, month: str, asof_day: int, baseline: dict
     got = (-neg.loc[f].groupby("sub")["amount"].sum()).to_dict()
     hist = df[df["month"].isin(baseline["months"])]
     hneg = hist[hist["amount"] < 0]
-    fixed_subs = set(hneg.loc[is_fixed(hneg), "sub"])
+    fixed_subs = set(hneg.loc[is_fixed(hneg), "sub"]) | set(fixed_amounts())
     # 「1件でも計上されていれば残りは無い」とすると、サブスクのように月内へ
     # 何度も請求が来る費目で大きく取りこぼす。見込みに届いていない分を残りとみなす
     est = sum(max(0.0, baseline["exp"][s]["value"] - float(got.get(s, 0.0)))
@@ -531,7 +571,7 @@ def remaining_budget(df: pd.DataFrame, month: str, asof_day: int,
     if d < dim:            # 終わった月にこれ以上落ちるものは無い
         hist = df[df["month"].isin(baseline["months"])]
         hneg = hist[hist["amount"] < 0]
-        for s in set(hneg.loc[is_fixed(hneg), "sub"]):
+        for s in set(hneg.loc[is_fixed(hneg), "sub"]) | set(fixed_amounts()):
             e = baseline["exp"].get(s)
             if e is None or e["value"] <= 0:
                 continue
@@ -1248,16 +1288,20 @@ if role:
                                         f'<div class="{size}" style="color:{color}">{value}</div>'
                                         f'<div class="ph-sub">{sub}</div></div>')
 
+                            # 使った額のうち、自分の裁量で動かせるのは変動費だけ。
+                            # 固定費と混ぜて出すと「何にそんなに使ったのか」が分からなくなる
+                            fixed_paid = sum(x["value"] for x in r["booked_rows"])
+                            var_paid = r["spent"] - fixed_paid
+                            paid_note = f"固定費 {fyen(fixed_paid)} ／ 変動費 {fyen(var_paid)}"
+
                             # 上段2つ: 日々の判断に使う数字。同じ大きさで並べる
                             # 過去の月も見られるので、ラベルに「今月」とは書かない
-                            upcoming_note = (f"＋ 今後落ちる固定費 {fyen(r['upcoming'])}"
-                                             if r["upcoming"] > 0 else "この月はすべて計上済み")
                             if over:
                                 main = (
                                     cell("目標からの超過額", fyen(-r["remain"]),
                                          f"上限 {fyen(r['cap'])} に対して {fyen(r['spent'] + r['upcoming'])}",
                                          ERROR)
-                                    + cell("使った額", fyen(r["spent"]), upcoming_note, INK))
+                                    + cell("使った額", fyen(r["spent"]), paid_note, INK))
                             elif r["per_day"]:
                                 main = (
                                     cell("1日あたり使えるのは", fyen(r["per_day"]), span, GREEN_900)
@@ -1267,8 +1311,7 @@ if role:
                             else:
                                 main = (
                                     cell("最終的な余り", fyen(r["remain"]), "今月は終了", GREEN_900)
-                                    + cell("使った額", fyen(r["spent"]),
-                                           f"上限 {fyen(r['cap'])}", INK))
+                                    + cell("使った額", fyen(r["spent"]), paid_note, INK))
 
                             # 下段2つ: ペースの良し悪しを示す指標
                             if v_med > 0:
@@ -1318,11 +1361,14 @@ if role:
                                      "金額": ""},
                                     {"項目": "= 使ってよい上限", "金額": fyen(r["cap"])},
                                     {"項目": "− すでに使った額", "金額": fyen(r["spent"])},
+                                    {"項目": "　　うち 固定費（支払い済み）", "金額": fyen(fixed_paid)},
+                                    {"項目": "　　うち 変動費", "金額": fyen(var_paid)},
                                     {"項目": "− 今後落ちる固定費", "金額": fyen(r["upcoming"])},
                                     {"項目": "= 残り使える額", "金額": fyen(r["remain"])},
                                 ]))
 
-                                KIND_LABEL = {"monthly": "毎月", "periodic": "隔月等", "irregular": "不定期"}
+                                KIND_LABEL = {"monthly": "毎月", "periodic": "隔月等",
+                                              "irregular": "不定期", "fixed": "確定額"}
                                 fc1, fc2 = st.columns(2)
                                 with fc1:
                                     st.markdown(f"**今後落ちる固定費の内訳**（{fyen(r['upcoming'])}）")
@@ -1384,6 +1430,22 @@ if role:
                             fig.update_xaxes(title_text="日", dtick=5, range=[1, 31])
                             st.plotly_chart(base_layout(fig, height=300), width="stretch",
                                             key="pace_var_cum", config=PLOTLY_CONFIG)
+
+                            # 何にいくら使っているか。ペース管理の主目的なので折りたたまない
+                            cur_neg = pdf[(pdf["month"] == pace_month) & (pdf["day"] <= asof_day)
+                                          & (pdf["amount"] < 0)]
+                            cur_var = cur_neg[~is_fixed(cur_neg)]
+                            if len(cur_var):
+                                by_sub = (-cur_var.groupby("sub")["amount"].sum()).sort_values(
+                                    ascending=False)
+                                st.markdown(f"**変動費の内訳**（{asof_day}日時点・{fyen(var_paid)}）")
+                                html_table(pd.DataFrame([
+                                    {"費目": s, "金額": fyen(v),
+                                     "割合": f"{v / by_sub.sum() * 100:.0f}%",
+                                     "件数": int((cur_var["sub"] == s).sum())}
+                                    for s, v in by_sub.items()]))
+                            else:
+                                st.caption("この期間の変動費はまだありません。")
 
                             with st.expander("▼ この計算の前提"):
                                 st.markdown(
