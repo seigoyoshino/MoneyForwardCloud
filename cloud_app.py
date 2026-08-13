@@ -16,6 +16,8 @@ import json
 import math
 from pathlib import Path
 
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -183,6 +185,387 @@ def apply_scope(df: pd.DataFrame, exclude_special: bool) -> pd.DataFrame:
 CHART_MONTHS_MOBILE = 12
 
 
+def is_fixed(df: pd.DataFrame, cats: list[str] | None = None,
+             subs: list[str] | None = None) -> pd.Series:
+    """固定費の判定。既定はバンドルの settings.json。ローカル版と同じ。"""
+    if cats is None or subs is None:
+        st_ = load_settings()
+        cats = (st_.get("fixed_cats") or FIXED_CATS) if cats is None else cats
+        subs = (st_.get("fixed_subs") or FIXED_SUBS) if subs is None else subs
+    return (df["amount"] < 0) & (df["cat"].isin(cats) | df["sub"].isin(subs))
+
+
+def valid_rows(df: pd.DataFrame) -> pd.DataFrame:
+    return df[(df["calc"] == 1) & (df["transfer"] != 1)]
+
+
+# ============================================================
+# ペース管理（「今月」タブ）— docs/pace_design.md
+#
+# ここの計算はサイドバーのトグルに影響されない（決定事項4）。
+# クラウド版 cloud_app.py にも同じものを置くこと。差し替えるのは as-of 日の求め方だけ。
+# ============================================================
+JST = timezone(timedelta(hours=9))
+CARD_LAG_DAYS = 4          # カード計上遅延。実測値（Amex 3日 / PASMO・Amazon 4日 / 楽天7日）
+BASELINE_WINDOW = 6        # 基準線に使う過去月数
+FREQ_HI, FREQ_LO = 0.9, 0.3  # 出現頻度の分岐（毎月 / 隔月等 / 不定期）
+BONUS_RE = r"賞与|ボーナス"
+BONUS_SUB = "賞与"
+LEVELED_CONTENT = "年次費用の月割り"
+SHARE_CONTENT = "相手が直接払っている分の自己負担"
+
+
+# 設定はバンドル（settings.json / settlement.json）から来る。
+# バンドル読み込み後に _BUNDLE_SETTINGS / _BUNDLE_SETTLE へ入れる。
+_BUNDLE_SETTINGS: dict = {}
+_BUNDLE_SETTLE: dict = {}
+
+
+def load_settings() -> dict:
+    return _BUNDLE_SETTINGS
+
+
+def settle_config() -> dict:
+    return _BUNDLE_SETTLE
+
+
+def leveled_defs() -> dict[str, dict]:
+    """平準化する費目 → 契約額(amount)と支払間隔(months)。data/settings.json の leveled_subs。"""
+    raw = load_settings().get("leveled_subs", {})
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            v = {"amount": v, "months": 12}
+        amt, mon = v.get("amount"), int(v.get("months") or 12)
+        if amt is None:
+            continue
+        out[k] = {"amount": float(amt), "months": mon, "monthly": float(amt) / mon,
+                  "note": str(v.get("note", ""))}
+    return out
+
+
+def savings_target() -> float:
+    try:
+        return float(load_settings().get("savings_target", 0.10))
+    except Exception:
+        return 0.10
+
+
+def baseline_from() -> str | None:
+    """基準線の起点月（"YYYY-MM"）。住み替えなどで生活水準が変わった月を指定する。
+
+    これ以前のデータは基準線に使わない。前の家の家賃・管理費が混ざると
+    「今後落ちる固定費」が過小になり、残り使える額が実態より多く出る。
+    """
+    v = load_settings().get("baseline_from")
+    return str(v) if v else None
+
+
+def settle_shares() -> dict:
+    """清算の按分ルールをペース計算で使える形にまとめる。"""
+    c = settle_config()
+    cfg = c.get("config", c)
+    rent = cfg.get("rent_subs") or RENT_SUBS_DEFAULT
+    split = cfg.get("fixed_subs") or SETTLE_FIXED_DEFAULT
+    rr = cfg.get("rent_ratio") or [2, 1]
+    sr = cfg.get("split_ratio") or [1, 1]
+    loans = {m: int(v.get("wife_loan", 0)) for m, v in (c.get("months") or {}).items()
+             if v.get("wife_loan")}
+    default_loan = int(cfg.get("wife_loan_default") or 0)
+    if not default_loan and loans:            # 未保存なら過去の最頻値で代用する
+        vals = list(loans.values())
+        default_loan = max(set(vals), key=vals.count)
+    return {"rent_subs": rent, "split_subs": split,
+            "rent_share": rr[0] / sum(rr) if sum(rr) else 0.5,
+            "split_share": sr[0] / sum(sr) if sum(sr) else 0.5,
+            "wife_loans": loans, "wife_loan_default": default_loan}
+
+
+CONTENT_SUBS_DEFAULT = [
+    # MF上ひとつの中項目に混ざっているものを、内容で別の中項目として切り出す。
+    # 切り出さないと基準線の中央値が引きずられ、見込みが実態から外れる。
+    {"name": BONUS_SUB, "from": "給与", "pattern": BONUS_RE, "min_amount": 100000},
+    {"name": "カード年会費", "from": "サブスク", "pattern": r"年会費|ネンカイヒ"},
+]
+
+
+def content_subs() -> list[dict]:
+    v = load_settings().get("content_subs")
+    return v if isinstance(v, list) and v else CONTENT_SUBS_DEFAULT
+
+
+def split_by_content(df: pd.DataFrame) -> pd.DataFrame:
+    """内容欄を見て中項目を切り出す。
+
+    賞与は中項目「給与」に、カード年会費は「サブスク」に混ざっている。
+    どちらも年1回なので、切り出したうえで年次費用として平準化すると
+    月々の見込みが素直になる。
+    """
+    d = df.copy()
+    for rule in content_subs():
+        name, src = rule.get("name"), rule.get("from")
+        pat, lo = rule.get("pattern"), rule.get("min_amount")
+        if not (name and src and pat):
+            continue
+        hit = (d["sub"] == src) & d["content"].str.contains(pat, na=False)
+        if lo:
+            hit &= d["amount"].abs() >= float(lo)
+        d.loc[hit, "sub"] = name
+    return d
+
+
+def level_annual(df: pd.DataFrame) -> pd.DataFrame:
+    """年次・複数年の費用を毎月の積立に置き換える（落ちた月だけ突出するのを防ぐ）。"""
+    defs = leveled_defs()
+    if not defs or df.empty:
+        return df
+    src = df[df["sub"].isin(defs)]
+    if src.empty:
+        return df
+    months, rows = sorted(df["month"].unique()), []
+    for sub, d in defs.items():
+        g = src[src["sub"] == sub]
+        if g.empty or not d["monthly"]:
+            continue
+        cat = str(g["cat"].iloc[-1])
+        for m in months:
+            rows.append({"id": f"__leveled__{sub}__{m}", "date": f"{m}-01", "month": m,
+                         "content": LEVELED_CONTENT, "amount": -d["monthly"], "inst": "",
+                         "cat": cat, "sub": sub, "memo": "", "calc": 1, "transfer": 0})
+    return pd.concat([df[~df["sub"].isin(defs)], pd.DataFrame(rows)], ignore_index=True)
+
+
+def apply_settlement_share(df: pd.DataFrame) -> pd.DataFrame:
+    """清算対象の費用を「按分後の自分の負担」に置き換える。
+
+    相手と分け合う費用は、住宅費・光熱費・割り勘でルールがばらばらだった。
+    清算タブが持っている按分ルール1つに統一する。
+      住宅費（ローン返済・管理費等）… (MF計上額 + 相手のローン直接払い) × 2/3
+      折半対象（水道代・電気代・割り勘の食料品/日用品）… 実額 × 1/2
+    相手からの清算入金（割り勘代）は収入に入れない。按分後の自分の負担だけを
+    費用として持つので、二重計上にはならない。
+    """
+    s = settle_shares()
+    if df.empty:
+        return df
+    d = df.copy()
+    d["amount"] = d["amount"].astype(float)   # 按分で小数になるため
+    neg = d["amount"] < 0
+
+    # 折半対象はその場で自分の取り分に縮める（計上日の分布を保つため）
+    d.loc[neg & d["sub"].isin(s["split_subs"]), "amount"] *= s["split_share"]
+
+    # 住宅費も同様に縮めたうえで、相手が直接払っている分の自分の取り分を足す
+    rent_mask = neg & d["sub"].isin(s["rent_subs"])
+    d.loc[rent_mask, "amount"] *= s["rent_share"]
+
+    # 相手のローン分は必ずローン返済の費目に載せる。月によっては当月まだ
+    # ローンが落ちておらず、その月の明細から拾うと別の費目に付いてしまう
+    loan_sub = s["rent_subs"][0] if s["rent_subs"] else "ローン返済"
+    src = d[neg & (d["sub"] == loan_sub)]
+    loan_cat = str(src["cat"].iloc[-1]) if len(src) else "住宅"
+    loan_day = int(pd.to_datetime(src["date"], errors="coerce").dt.day.median()) if len(src) else 27
+
+    rows = []
+    for m in sorted(d.loc[rent_mask, "month"].unique()):
+        loan = s["wife_loans"].get(m, s["wife_loan_default"])
+        if not loan:
+            continue
+        same = d[(d["month"] == m) & (d["sub"] == loan_sub) & neg]
+        if len(same):
+            day = int(pd.to_datetime(same["date"], errors="coerce").dt.day.max())
+        else:
+            day = min(loan_day, pd.Period(m, "M").days_in_month)
+        rows.append({"id": f"__share__{m}", "date": f"{m}-{day:02d}", "month": m,
+                     "content": SHARE_CONTENT, "amount": -loan * s["rent_share"],
+                     "inst": "", "cat": loan_cat, "sub": loan_sub,
+                     "memo": "", "calc": 1, "transfer": 0})
+    if rows:
+        d = pd.concat([d, pd.DataFrame(rows)], ignore_index=True)
+    return d
+
+
+def pace_base(master: pd.DataFrame) -> pd.DataFrame:
+    """ペース計算の土台。サイドバーのトグルには影響されない。
+
+    経常ベース → 賞与を切り出し → 清算対象を按分後の自分の負担に →
+    相手からの清算入金を除外 → 年次費用を平準化。
+    """
+    d = apply_scope(valid_rows(master), True)
+    d = split_by_content(d)
+    d = apply_settlement_share(d)
+    d = d[d["sub"] != WARIKAN_SUB]        # 清算入金は収入に含めない
+    d = level_annual(d)
+    d["d"] = pd.to_datetime(d["date"], errors="coerce")
+    d["day"] = d["d"].dt.day
+    return d.dropna(subset=["day"])
+
+
+def days_in_month(m: str) -> int:
+    return pd.Period(m, "M").days_in_month
+
+
+def prev_months(m: str, n: int) -> list[str]:
+    p = pd.Period(m, "M")
+    return [str(p - i) for i in range(n, 0, -1)]
+
+
+def pace_asof(df: pd.DataFrame, month: str, lag: int = CARD_LAG_DAYS,
+              exported_at: str | None = None) -> tuple[int, pd.Timestamp]:
+    """(as-of の日, as-of の日付)。カード計上遅延ぶん手前に置く。
+
+    誤差はどの方式でも過小（＝「まだ使える」と嘘をつく）方向に出るため、
+    データが揃っている手前の日で分子も分母もそろえる。
+
+    ローカル版との違いはここだけ。クラウドは書き出し時刻（exported_at）が
+    分かるので、明細の最終日ではなくそれを使う（更新が止まっていても正しく出る）。
+    """
+    dim = days_in_month(month)
+    start = pd.Timestamp(f"{month}-01")
+    end = start + pd.Timedelta(days=dim - 1)
+    today = pd.Timestamp(datetime.now(JST).date())
+    exp = pd.to_datetime(exported_at, errors="coerce")
+    last = pd.to_datetime(df["date"], errors="coerce").max()
+    if pd.notna(exp):
+        last = min(last, exp.normalize()) if pd.notna(last) else exp.normalize()
+    # 「信じられるデータの最終日」。遅延を引くのはここで、月末からではない
+    avail = min(x for x in (today, last) if pd.notna(x)) - pd.Timedelta(days=lag)
+    if avail >= end:      # 終わった月は満額で見る
+        return dim, end
+    if avail < start:
+        return 0, avail
+    return int(avail.day), avail
+
+
+def _classify(vals: list[float]) -> tuple[str, float]:
+    """出現頻度で補完方法を決める（設計メモ §5）。"""
+    hits = [v for v in vals if abs(v) > 1e-9]
+    n = len(vals) or 1
+    rate = len(hits) / n
+    if rate >= FREQ_HI:
+        return "monthly", float(pd.Series(hits).median())
+    if rate >= FREQ_LO:
+        return "periodic", sum(vals) / n
+    return "irregular", 0.0
+
+
+@st.cache_data(show_spinner=False)
+def build_baseline(df: pd.DataFrame, month: str, window: int = BASELINE_WINDOW,
+                   start: str | None = None) -> dict:
+    """対象月より前の window ヶ月から中項目ごとの見込みを作る（未来を見ない）。
+
+    start を指定すると、それ以前の月は使わない。住み替えで生活水準が変わった
+    ときに、前の家のデータが基準線に混ざるのを防ぐ。
+    """
+    ms = prev_months(month, window)
+    if start:
+        ms = [m for m in ms if m >= start] or ms
+    hist = df[df["month"].isin(ms)]
+    out = {"months": ms, "exp": {}, "inc": {}}
+    for key, sign in (("exp", -1), ("inc", 1)):
+        d = hist[hist["amount"] < 0] if sign < 0 else hist[hist["amount"] > 0]
+        if d.empty:
+            continue
+        piv = d.pivot_table(index="sub", columns="month", values="amount",
+                            aggfunc="sum", fill_value=0.0) * sign
+        for sub in piv.index:
+            vals = [float(piv.loc[sub, m]) if m in piv.columns else 0.0 for m in ms]
+            kind, value = _classify(vals)
+            out[key][sub] = {"kind": kind, "value": value}
+    return out
+
+
+def forecast_landing(df: pd.DataFrame, month: str, asof_day: int, baseline: dict) -> float:
+    """月末着地の支出見込み（方式D: 固定費は費目別に補完、変動費は日割り）。"""
+    dim = days_in_month(month)
+    asof_day = max(1, min(asof_day, dim))
+    cur = df[df["month"] == month]
+    seen = cur[cur["day"] <= asof_day]
+    neg = seen[seen["amount"] < 0]
+    f = is_fixed(neg)
+    fixed_a = float(-neg.loc[f, "amount"].sum())
+    var_a = float(-neg.loc[~f, "amount"].sum())
+
+    got = (-neg.loc[f].groupby("sub")["amount"].sum()).to_dict()
+    hist = df[df["month"].isin(baseline["months"])]
+    hneg = hist[hist["amount"] < 0]
+    fixed_subs = set(hneg.loc[is_fixed(hneg), "sub"])
+    # 「1件でも計上されていれば残りは無い」とすると、サブスクのように月内へ
+    # 何度も請求が来る費目で大きく取りこぼす。見込みに届いていない分を残りとみなす
+    est = sum(max(0.0, baseline["exp"][s]["value"] - float(got.get(s, 0.0)))
+              for s in fixed_subs if s in baseline["exp"])
+    return fixed_a + est + var_a * dim / asof_day
+
+
+def remaining_budget(df: pd.DataFrame, month: str, asof_day: int,
+                     target: float, baseline: dict) -> dict:
+    """残り使える額（設計メモ §3）。上限は経常収入の見込みから作る。"""
+    dim = days_in_month(month)
+    d = max(1, min(asof_day, dim))
+    cur = df[df["month"] == month]
+    seen = cur[cur["day"] <= d]
+
+    got_inc = seen.loc[seen["amount"] > 0].groupby("sub")["amount"].sum().to_dict()
+    inc_est, irregular = 0.0, 0.0
+    for sub, e in baseline["inc"].items():
+        if e["kind"] == "irregular":
+            continue
+        inc_est += max(float(got_inc.get(sub, 0.0)), e["value"])
+    for sub, v in got_inc.items():
+        e = baseline["inc"].get(sub)
+        if e is None or e["kind"] == "irregular":
+            irregular += float(v)
+
+    cap = inc_est * (1 - target)
+    spent = float(-seen.loc[seen["amount"] < 0, "amount"].sum())
+
+    seen_neg = seen[seen["amount"] < 0]
+    booked = (-seen_neg.loc[is_fixed(seen_neg)].groupby("sub")["amount"].sum())
+    booked_rows = [{"sub": s, "value": float(x)}
+                   for s, x in booked.sort_values(ascending=False).items()]
+    done = set(booked.index)
+
+    upcoming_rows = []
+    if d < dim:            # 終わった月にこれ以上落ちるものは無い
+        hist = df[df["month"].isin(baseline["months"])]
+        hneg = hist[hist["amount"] < 0]
+        for s in set(hneg.loc[is_fixed(hneg), "sub"]):
+            e = baseline["exp"].get(s)
+            if e is None or e["value"] <= 0:
+                continue
+            # 計上済みでも、見込みに届いていなければ差分は今後落ちるとみなす
+            # （サブスクのように月内へ何度も請求が来る費目の取りこぼしを防ぐ）
+            got = float(booked.get(s, 0.0))
+            rest = e["value"] - got
+            if rest <= 0:
+                continue
+            upcoming_rows.append({"sub": s, "value": rest, "kind": e["kind"], "booked": got})
+        upcoming_rows.sort(key=lambda x: -x["value"])
+    upcoming = sum(x["value"] for x in upcoming_rows)
+
+    remain = cap - spent - upcoming
+    left = dim - d
+    return {"income_est": inc_est, "cap": cap, "spent": spent, "upcoming": upcoming,
+            "remain": remain, "left_days": left,
+            "per_day": (remain / left if left > 0 else None),
+            "irregular_income": irregular,
+            "upcoming_rows": upcoming_rows, "booked_rows": booked_rows}
+
+
+def variable_cumsum(df: pd.DataFrame, month: str, upto: int | None = None) -> list[float]:
+    """変動費の日次累積（1日〜月末）。upto を超える日は None にする。"""
+    dim = days_in_month(month)
+    cur = df[(df["month"] == month) & (df["amount"] < 0)]
+    cur = cur[~is_fixed(cur)]
+    by_day = (-cur.groupby("day")["amount"].sum()).reindex(range(1, dim + 1), fill_value=0.0)
+    cum = by_day.cumsum().tolist()
+    if upto is not None:
+        cum = [v if i + 1 <= upto else None for i, v in enumerate(cum)]
+    return cum
+
+
 def is_mobile() -> bool:
     """スマホからのアクセスかを User-Agent で判定する。
     Streamlit にビューポート幅を取る手段がないための代替で、幅そのものではない。
@@ -338,7 +721,7 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
     mrows = master[master["month"] == s_month]
 
     # 以下2つは settlement.json に保存された「キー」を読むためのもの。
-    # 表示名（NM_ME / NM_PT）とは別物で、ローカル版は "僕" / "パートナー" で保存する。
+    # 表示名（NM_ME / NM_PT）とは別物で、ローカル版は固定のキー名で保存する。
     # 表示名を Secrets で変えても金額が 0 にならないよう、保存側のキーで引く。
     def _me_val(r: dict) -> float:
         """本人側の金額を取り出す（保存時の列名ゆれに対応）。"""
@@ -528,6 +911,22 @@ st.markdown(f"""<style>
   }}
   table.ntab {{ width: 100%; border-collapse: collapse; font-size: 13px;
     font-variant-numeric: tabular-nums; }}
+  /* 「今月」タブの結論カード（清算ビューの .settle-hero と同じ考え方） */
+  .pace-hero {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px;
+    background: {LINE}; border: 1px solid {LINE}; border-radius: 12px;
+    overflow: hidden; margin: 4px 0 14px; }}
+  .pace-hero .ph {{ background: #FFFFFF; padding: 16px 18px; }}
+  .pace-hero .ph-label {{ color: {SUBTLE}; font-size: 12px; line-height: 1.4; }}
+  .pace-hero .ph-big {{ font-size: 34px; font-weight: 600; line-height: 1.2;
+    font-variant-numeric: tabular-nums; margin-top: 2px; }}
+  .pace-hero .ph-mid {{ font-size: 26px; font-weight: 600; line-height: 1.25;
+    font-variant-numeric: tabular-nums; margin-top: 2px; }}
+  .pace-hero .ph-sub {{ color: {SUBTLE}; font-size: 12px; margin-top: 5px;
+    line-height: 1.45; }}
+  @media (max-width: 640px) {{
+    .pace-hero {{ grid-template-columns: 1fr; }}
+    .pace-hero .ph-big {{ font-size: 30px; }}
+  }}
   table.ntab th {{ color: {SUBTLE}; font-weight: 500; font-size: 12px;
     padding: 8px 12px; border-bottom: 1px solid {LINE};
     background: #FFFFFF; position: sticky; top: 0; white-space: nowrap; }}
@@ -640,6 +1039,9 @@ if role:
             chart_months = chart_window(all_months, IS_MOBILE)
             settle = bundle.get("settlement", {})
             settings = bundle.get("settings", {})
+            # ペース計算はローカル版と同じ関数を使う。設定の入口だけバンドルに差し替える
+            _BUNDLE_SETTINGS = settings
+            _BUNDLE_SETTLE = settle
 
             st.sidebar.title("🧾 家計ダッシュボード")
             st.sidebar.caption(f"クラウド版（閲覧専用）\nデータ更新: {bundle.get('exported_at', '不明')}")
@@ -712,8 +1114,8 @@ if role:
                           f"前月 {fyen(prev['balance'])}" if prev else None, delta_color="off")
                 c4.metric("貯蓄率", f"{kpi['rate']:.1f}%" if kpi["rate"] is not None else "—")
 
-                tab_ov, tab_cat, tab_fix, tab_settle, tab_tx = st.tabs(
-                    ["概要", "カテゴリ", "固定費・サブスク", "清算", "明細"])
+                tab_now, tab_ov, tab_cat, tab_fix, tab_settle, tab_tx = st.tabs(
+                    ["今月", "概要", "カテゴリ", "固定費", "清算", "明細"])
 
                 monthly = []
                 grouped = dict(tuple(scoped_all.groupby("month")))
@@ -722,6 +1124,227 @@ if role:
                     monthly.append({"label": m[2:].replace("-", "/"), "収入": s["income"],
                                     "支出": s["expense"], "収支": s["balance"]})
                 monthly = pd.DataFrame(monthly)
+
+                # ---------- 今月（ペース管理） ----------
+                with tab_now:
+                    pdf = pace_base(master)
+                    pace_month = sel_month if mode == "月" else months[-1]
+                    target = savings_target()
+
+                    bl_start = baseline_from()
+                    want = [m for m in prev_months(pace_month, BASELINE_WINDOW)
+                            if not bl_start or m >= bl_start]
+                    have = [m for m in want if m in set(pdf["month"])]
+
+                    if pace_month not in set(pdf["month"]):
+                        st.info(f"{month_label(pace_month)} のデータがまだありません。")
+                    elif not have:
+                        st.warning(
+                            f"{month_label(pace_month)} の基準線に使える月がありません"
+                            + (f"（起点 {month_label(bl_start)} 以降のデータが必要です）。" if bl_start
+                               else "。"))
+                    else:
+                        asof_day, asof_ts = pace_asof(pdf, pace_month,
+                                                          exported_at=bundle.get("exported_at"))
+                        dim = days_in_month(pace_month)
+                        bl = build_baseline(pdf, pace_month, BASELINE_WINDOW, bl_start)
+
+                        if asof_day < 1:
+                            st.info(
+                                f"{month_label(pace_month)} はまだ集計できる日数がありません。"
+                                f"カードの計上が{CARD_LAG_DAYS}日ほど遅れるため、"
+                                f"{CARD_LAG_DAYS + 4}日目ごろから表示できます。"
+                            )
+                        else:
+                            r = remaining_budget(pdf, pace_month, asof_day, target, bl)
+                            over = r["remain"] < 0
+
+                            # ---- 表示に使う数字をここでまとめて作る（計算は変えない） ----
+                            # 残り日数は as-of の翌日から月末まで。カレンダー上の「今日」より
+                            # 数日ぶん多いので、日数だけでなく期間も出して誤解を避ける
+                            span_from = asof_ts + pd.Timedelta(days=1)
+                            span = (f"{span_from.month}月{span_from.day}日〜"
+                                    f"{int(pace_month[5:7])}月{dim}日の{r['left_days']}日分")
+
+                            hist_months = bl["months"]
+                            series = [variable_cumsum(pdf, m) for m in hist_months]
+                            med = [float(pd.Series([s[i] for s in series if i < len(s)]).median())
+                                   for i in range(31)]
+                            cur_cum = variable_cumsum(pdf, pace_month, upto=asof_day)
+                            v_now = next((v for v in reversed(cur_cum) if v is not None), 0.0)
+                            v_med = med[min(asof_day, 31) - 1]
+
+                            land = rate_est = None
+                            if asof_day >= CARD_LAG_DAYS + 4:
+                                land = forecast_landing(pdf, pace_month, asof_day, bl)
+                                if r["income_est"] > 0:
+                                    rate_est = (r["income_est"] - land) / r["income_est"] * 100
+
+                            def cell(label, value, sub, color=INK, size="ph-big"):
+                                return (f'<div class="ph"><div class="ph-label">{label}</div>'
+                                        f'<div class="{size}" style="color:{color}">{value}</div>'
+                                        f'<div class="ph-sub">{sub}</div></div>')
+
+                            # 上段2つ: 日々の判断に使う数字。同じ大きさで並べる
+                            # 過去の月も見られるので、ラベルに「今月」とは書かない
+                            upcoming_note = (f"＋ 今後落ちる固定費 {fyen(r['upcoming'])}"
+                                             if r["upcoming"] > 0 else "この月はすべて計上済み")
+                            if over:
+                                main = (
+                                    cell("目標からの超過額", fyen(-r["remain"]),
+                                         f"上限 {fyen(r['cap'])} に対して {fyen(r['spent'] + r['upcoming'])}",
+                                         ERROR)
+                                    + cell("使った額", fyen(r["spent"]), upcoming_note, INK))
+                            elif r["per_day"]:
+                                main = (
+                                    cell("1日あたり使えるのは", fyen(r["per_day"]), span, GREEN_900)
+                                    + cell("あと使えるのは", fyen(r["remain"]),
+                                           f"上限 {fyen(r['cap'])} − 使った額 {fyen(r['spent'])}"
+                                           f" − 今後の固定費 {fyen(r['upcoming'])}", GREEN_900))
+                            else:
+                                main = (
+                                    cell("最終的な余り", fyen(r["remain"]), "今月は終了", GREEN_900)
+                                    + cell("使った額", fyen(r["spent"]),
+                                           f"上限 {fyen(r['cap'])}", INK))
+
+                            # 下段2つ: ペースの良し悪しを示す指標
+                            if v_med > 0:
+                                diff = v_now / v_med - 1
+                                pace_val = f"{diff * 100:+.0f}%"
+                                pace_sub = (f"{asof_day}日時点 {fyen(v_now)} ／ "
+                                            f"過去{len(hist_months)}ヶ月の中央値 {fyen(v_med)}")
+                                pace_col = ERROR if diff > 0.05 else (GREEN_900 if diff < -0.05 else INK)
+                            else:
+                                pace_val, pace_sub, pace_col = "—", "比較できる過去データがありません", SUBTLE
+
+                            if rate_est is None:
+                                rate_val, rate_sub, rate_col = "—", "月初は不安定なため非表示", SUBTLE
+                            else:
+                                gap = rate_est - target * 100
+                                rate_val = f"{rate_est:.1f}%"
+                                rate_sub = (f"目標 {target*100:.0f}% に対して {gap:+.1f}pt"
+                                            f" ／ 着地見込み {fyen(land)}")
+                                rate_col = GREEN_900 if gap >= 0 else ERROR
+
+                            side = (
+                                cell(f"変動費のペース（過去{len(hist_months)}ヶ月の同じ日と比べて）",
+                                     pace_val, pace_sub, pace_col, "ph-mid")
+                                + cell("このペースでの貯蓄率", rate_val, rate_sub, rate_col, "ph-mid"))
+
+                            st.markdown(f'<div class="pace-hero">{main}{side}</div>',
+                                        unsafe_allow_html=True)
+                            st.caption(
+                                f"{month_label(pace_month)}／{asof_ts.month}月{asof_ts.day}日時点のデータ"
+                                f'（{asof_day} / {dim}日経過。カード計上の遅れ{CARD_LAG_DAYS}日分を'
+                                "手前に置いています）")
+                            if r["irregular_income"] > 0:
+                                st.caption(f"※ 今月は賞与など不定期の入金 {fyen(r['irregular_income'])} が"
+                                           "あります（上限には含めていません）")
+                            if bl_start and len(hist_months) < BASELINE_WINDOW:
+                                st.warning(
+                                    f"生活水準が変わった {month_label(bl_start)} を起点にしているため、"
+                                    f"基準線は **{len(hist_months)}ヶ月ぶん**（{'・'.join(month_label(m) for m in hist_months)}）"
+                                    f"のデータで作っています。{BASELINE_WINDOW}ヶ月そろうまでは見込みがぶれやすく、"
+                                    "特に隔月・不定期の費目は精度が落ちます。", icon="⚠️")
+
+                            # ---- 根拠 ----
+                            with st.expander("▼ 残り使える額の計算過程"):
+                                html_table(pd.DataFrame([
+                                    {"項目": "今月の収入見込み", "金額": fyen(r["income_est"])},
+                                    {"項目": f"× {(1-target)*100:.0f}%（目標貯蓄率 {target*100:.0f}%）",
+                                     "金額": ""},
+                                    {"項目": "= 使ってよい上限", "金額": fyen(r["cap"])},
+                                    {"項目": "− すでに使った額", "金額": fyen(r["spent"])},
+                                    {"項目": "− 今後落ちる固定費", "金額": fyen(r["upcoming"])},
+                                    {"項目": "= 残り使える額", "金額": fyen(r["remain"])},
+                                ]))
+
+                                KIND_LABEL = {"monthly": "毎月", "periodic": "隔月等", "irregular": "不定期"}
+                                fc1, fc2 = st.columns(2)
+                                with fc1:
+                                    st.markdown(f"**今後落ちる固定費の内訳**（{fyen(r['upcoming'])}）")
+                                    if r["upcoming_rows"]:
+                                        html_table(pd.DataFrame([
+                                            {"費目": x["sub"], "見込み": fyen(x["value"]),
+                                             "頻度": KIND_LABEL.get(x["kind"], x["kind"])}
+                                            for x in r["upcoming_rows"]]))
+                                    else:
+                                        st.caption("この月の固定費はすべて計上済みです。")
+                                with fc2:
+                                    st.markdown(f"**計上済みの固定費**（{fyen(sum(x['value'] for x in r['booked_rows']))}）")
+                                    if r["booked_rows"]:
+                                        html_table(pd.DataFrame([
+                                            {"費目": x["sub"], "実績": fyen(x["value"])}
+                                            for x in r["booked_rows"]]))
+                                    else:
+                                        st.caption("まだありません。")
+
+                                lv = leveled_defs()
+                                if lv:
+                                    st.caption(
+                                        "※ 年次費用（" + "・".join(lv) + "）は月割りの積立として"
+                                        f"毎月 {fyen(sum(d['monthly'] for d in lv.values()))} 計上しています")
+                                sh = settle_shares()
+                                st.caption(
+                                    f"※ {display_names()[1]}と分け合う費用は、清算タブと同じ按分で"
+                                    f"自分の負担分だけを計上しています"
+                                    f"（住宅費 {sh['rent_share']*100:.0f}%／"
+                                    f"{'・'.join(sh['split_subs'])} {sh['split_share']*100:.0f}%）。"
+                                    "相手からの清算入金は収入に含めていません")
+                                if sh["wife_loan_default"]:
+                                    st.caption(
+                                        f"※ 相手が自分の口座から直接払っているローン "
+                                        f"{fyen(sh['wife_loan_default'])} も住宅費の総額に含めています"
+                                        "（MFには載らないため清算タブの入力値を使用）")
+
+                            # ---- 変動費の累積グラフ ----
+                            st.subheader("変動費の使い方")
+                            st.caption("固定費は日々コントロールできないので、変動費だけで描いています。"
+                                       f"薄い線は過去{len(hist_months)}ヶ月、破線はその中央値。")
+                            fig = go.Figure()
+                            for m, cum in zip(hist_months, series):
+                                fig.add_trace(go.Scatter(
+                                    x=list(range(1, len(cum) + 1)), y=cum, mode="lines",
+                                    name=month_label(m), line=dict(color=GRAY_200, width=1),
+                                    hovertemplate="%{y:,.0f}円<extra>" + month_label(m) + "</extra>"))
+                            fig.add_trace(go.Scatter(
+                                x=list(range(1, 32)), y=med, mode="lines",
+                                name=f"過去{len(hist_months)}ヶ月の中央値",
+                                line=dict(color=GRAY_600, width=1.5, dash="dash"),
+                                hovertemplate="%{y:,.0f}円<extra>中央値</extra>"))
+                            fig.add_trace(go.Scatter(
+                                x=list(range(1, dim + 1)), y=cur_cum, mode="lines",
+                                name=month_label(pace_month),
+                                line=dict(color=GREEN_600, width=3),
+                                hovertemplate="%{y:,.0f}円<extra>" + month_label(pace_month) + "</extra>"))
+                            fig.add_vline(x=asof_day, line=dict(color=SUBTLE, width=1, dash="dot"))
+                            fig.update_xaxes(title_text="日", dtick=5, range=[1, 31])
+                            st.plotly_chart(base_layout(fig, height=300), width="stretch",
+                                            key="pace_var_cum", config=PLOTLY_CONFIG)
+
+                            with st.expander("▼ この計算の前提"):
+                                st.markdown(
+                                    f"""
+                                    - **as-of 日**: データの最終日から **{CARD_LAG_DAYS}日** 手前。
+                                      カードの計上が遅れるぶん、直近数日は必ず過少に出るため
+                                      （実測: Amex 3日 / モバイルPASMO・Amazon 4日 / 楽天カード 7日）。
+                                      分子（実績）も分母（経過日数）もこの日でそろえています
+                                    - **上限**: 経常収入の見込み × {(1-target)*100:.0f}%。
+                                      賞与など出現{FREQ_LO*100:.0f}%未満の不定期収入は含めません
+                                    - **収入・固定費の見込み**: 基準線（{'・'.join(month_label(m) for m in hist_months)}）
+                                      での中項目ごとの出現頻度で分岐
+                                      （{FREQ_HI*100:.0f}%以上は出現月の中央値、{FREQ_LO*100:.0f}〜{FREQ_HI*100:.0f}%は0の月込みの平均、
+                                      {FREQ_LO*100:.0f}%未満は補完しない）
+                                    - **基準線の起点**: {month_label(bl_start) + ' 以降' if bl_start else '指定なし（直前' + str(BASELINE_WINDOW) + 'ヶ月）'}。
+                                      住み替えなどで生活水準が変わると、前の家の家賃・管理費が混ざって
+                                      固定費の見込みが過小になるため。ローカル版の `data/settings.json` で変更します
+                                    - **相手と分け合う費用**: 清算タブと同じルールで按分し、
+                                      自分の負担分だけを計上しています。相手からの清算入金は収入に含めません
+                                    - **サイドバーのトグルは効きません**。ペース計算は
+                                      経常ベース・割り勘相殺OFF で固定です
+                                    - 目標貯蓄率は ローカル版の `data/settings.json` で変更します（クラウドは閲覧専用）
+                                    """
+                                )
 
                 # ---- 概要 ----
                 with tab_ov:
@@ -848,7 +1471,7 @@ if role:
                     f_cats = settings.get("fixed_cats", FIXED_CATS)
                     f_subs = settings.get("fixed_subs", FIXED_SUBS)
                     exp = period[period["amount"] < 0]
-                    fixed_mask = exp["cat"].isin(f_cats) | exp["sub"].isin(f_subs)
+                    fixed_mask = is_fixed(exp, f_cats, f_subs)
                     fixed_amt = -exp.loc[fixed_mask, "amount"].sum()
                     var_amt = -exp.loc[~fixed_mask, "amount"].sum()
                     ratio = (fixed_amt / (fixed_amt + var_amt) * 100
@@ -861,7 +1484,7 @@ if role:
 
                     pv = scoped_all[scoped_all["amount"] < 0].copy()
                     pv["kind"] = "変動費"
-                    pv.loc[pv["cat"].isin(f_cats) | pv["sub"].isin(f_subs), "kind"] = "固定費"
+                    pv.loc[is_fixed(pv, f_cats, f_subs), "kind"] = "固定費"
                     pivot = (-pv.pivot_table(index="month", columns="kind", values="amount",
                                              aggfunc="sum")).reindex(chart_months).fillna(0)
                     fig = go.Figure()
