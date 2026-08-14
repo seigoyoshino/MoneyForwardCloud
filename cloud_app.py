@@ -594,6 +594,61 @@ def remaining_budget(df: pd.DataFrame, month: str, asof_day: int,
             "upcoming_rows": upcoming_rows, "booked_rows": booked_rows}
 
 
+def variable_progress(df: pd.DataFrame, month: str, asof_day: int,
+                      total_budget: float, window: int = BASELINE_WINDOW) -> list[dict]:
+    """変動費を費目ごとに「いつもより」「枠に対して」の2軸で見る。
+
+    過去比: 直近 window ヶ月の「同じ日までの累積」の中央値との差。
+      起点（baseline_from）は当てない。住み替えで変わったのは契約で決まる
+      固定費であって、変動費に起点を当てる根拠がないため。実測でも
+      6ヶ月窓の方が起点ありより誤差が小さい（4,699 対 8,789）。
+
+    目標比: 月間の枠を経過割合で按分した額との差。着地の外挿はしない。
+      件数の少ない費目（月2件のチケット代など）で破綻するため、
+      過去比と同じ「as-of 時点同士の比較」にそろえる。
+
+    枠は 総枠 × 過去シェア。枠のある費目に限れば、差の合計は全体の過不足と一致する。
+    """
+    dim = days_in_month(month)
+    have = set(df["month"])
+    ms = [m for m in prev_months(month, window) if m in have]
+    neg = df[df["amount"] < 0]
+    var = neg[~is_fixed(neg)]
+
+    cur = var[(var["month"] == month) & (var["day"] <= asof_day)]
+    actual = -cur.groupby("sub")["amount"].sum()
+    if actual.empty:
+        return []
+
+    # 過去の「同じ日までの累積」。当月と条件をそろえる
+    hist = var[(var["month"].isin(ms)) & (var["day"] <= asof_day)]
+    hist_cum = -hist.groupby(["sub", "month"])["amount"].sum()
+
+    # 枠の配分に使うシェアは月間の合計から出す（月末までの取り分なので）
+    full = var[var["month"].isin(ms)]
+    tot = -full.groupby("sub")["amount"].sum()
+    share = tot / tot.sum() if tot.sum() > 0 else tot
+
+    rows = []
+    for sub, act in actual.items():
+        act = float(act)
+        vals = [float(hist_cum.get((sub, m), 0.0)) for m in ms]
+        usual = float(pd.Series(vals).median()) if vals else 0.0
+        budget = float(total_budget) * float(share.get(sub, 0.0))
+        paced = budget * asof_day / dim
+        rows.append({
+            "sub": sub, "actual": act, "usual": usual, "vs_usual": act - usual,
+            "budget": budget, "paced": paced, "vs_budget": act - paced,
+            # 枠が総枠の1%未満だと率が跳ねて意味を持たないので出さない
+            "ratio": (act / paced if paced > 0 and budget >= total_budget * 0.01 else None),
+            "count": int((cur["sub"] == sub).sum()),
+            "months": len(ms),
+        })
+    rows.sort(key=lambda x: -x["vs_usual"])
+    return rows
+
+
+
 def variable_cumsum(df: pd.DataFrame, month: str, upto: int | None = None) -> list[float]:
     """変動費の日次累積（1日〜月末）。upto を超える日は None にする。"""
     dim = days_in_month(month)
@@ -973,6 +1028,19 @@ st.markdown(f"""<style>
   table.ntab td {{ padding: 7px 12px; border-bottom: 1px solid #F0F0F2;
     vertical-align: top; }}
   table.ntab tr:last-child td {{ border-bottom: none; }}
+  /* 変動費の費目別進捗（スマホ想定の2行構成） */
+  .vprog {{ border: 1px solid {LINE}; border-radius: 8px; background: #FFFFFF;
+    overflow: hidden; margin: 2px 0 10px; }}
+  .vprog .vp {{ padding: 9px 12px; border-bottom: 1px solid #F0F0F2; }}
+  .vprog .vp:last-child {{ border-bottom: none; }}
+  .vprog .vp-head {{ display: flex; justify-content: space-between;
+    align-items: baseline; gap: 10px; }}
+  .vprog .vp-name {{ font-size: 13px; }}
+  .vprog .vp-amt {{ font-size: 15px; font-weight: 600; white-space: nowrap;
+    font-variant-numeric: tabular-nums; }}
+  .vprog .vp-sub {{ color: {SUBTLE}; font-size: 12px; margin-top: 3px;
+    line-height: 1.5; font-variant-numeric: tabular-nums; }}
+  .vprog .vp-sub b {{ font-weight: 600; }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
 </style>""", unsafe_allow_html=True)
@@ -1369,18 +1437,47 @@ if role:
                                             key="pace_var_cum", config=PLOTLY_CONFIG)
 
                             # 何にいくら使っているか。ペース管理の主目的なので折りたたまない
-                            cur_neg = pdf[(pdf["month"] == pace_month) & (pdf["day"] <= asof_day)
-                                          & (pdf["amount"] < 0)]
-                            cur_var = cur_neg[~is_fixed(cur_neg)]
-                            if len(cur_var):
-                                by_sub = (-cur_var.groupby("sub")["amount"].sum()).sort_values(
-                                    ascending=False)
+                            total_budget = r["remain"] + var_paid      # 変動費の総枠（月間）
+                            prog = variable_progress(pdf, pace_month, asof_day, total_budget)
+                            if prog:
                                 st.markdown(f"**変動費の内訳**（{asof_day}日時点・{fyen(var_paid)}）")
-                                html_table(pd.DataFrame([
-                                    {"費目": s, "金額": fyen(v),
-                                     "割合": f"{v / by_sub.sum() * 100:.0f}%",
-                                     "件数": int((cur_var["sub"] == s).sum())}
-                                    for s, v in by_sub.items()]))
+                                st.caption(
+                                    f"「いつも」は過去{prog[0]['months']}ヶ月の同じ日までの累積の中央値。"
+                                    f"「枠」は変動費の総枠 {fyen(total_budget)} を過去の使い方で割り振り、"
+                                    f"{asof_day}/{dim}日ぶんに縮めたもの（目安）。超過の大きい順。")
+                                cards = []
+                                for x in prog:
+                                    # 過去比に色をつける。金額が小さいうちは色をつけない
+                                    d = x["vs_usual"]
+                                    big = abs(d) >= 1000
+                                    if x["usual"] <= 0:
+                                        col = ERROR if (x["actual"] > 0 and big) else INK
+                                    elif big and d > x["usual"] * 0.2:
+                                        col = ERROR
+                                    elif big and d < -x["usual"] * 0.2:
+                                        col = GREEN_900
+                                    else:
+                                        col = INK
+                                    usual_txt = (f'いつも {fyen(x["usual"])} → '
+                                                 f'<b style="color:{col}">{fyen(d) if d < 0 else "+" + fyen(d)}</b>')
+                                    if x["budget"] <= 0:
+                                        budget_txt = "枠なし（新しい支出）"
+                                    else:
+                                        gap = x["vs_budget"]
+                                        pct = f"・{x['ratio']*100:.0f}%" if x["ratio"] is not None else ""
+                                        budget_txt = (f'枠 {fyen(x["paced"])}{pct} → '
+                                                      f'{fyen(gap) if gap < 0 else "+" + fyen(gap)}')
+                                    cards.append(
+                                        f'<div class="vp"><div class="vp-head">'
+                                        f'<span class="vp-name">{x["sub"]}（{x["count"]}件）</span>'
+                                        f'<span class="vp-amt">{fyen(x["actual"])}</span></div>'
+                                        f'<div class="vp-sub">{usual_txt} ／ {budget_txt}</div></div>')
+                                st.markdown(f'<div class="vprog">{"".join(cards)}</div>',
+                                            unsafe_allow_html=True)
+                                st.caption(
+                                    "※ 枠は過去の使い方から割り振った目安です。月ごとの振れが大きいので、"
+                                    "判断は「いつもより」を主に見てください。"
+                                    "枠のある費目に限れば、超過額の合計は全体の過不足と一致します。")
                             else:
                                 st.caption("この期間の変動費はまだありません。")
 
