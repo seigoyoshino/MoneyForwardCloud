@@ -594,6 +594,7 @@ def remaining_budget(df: pd.DataFrame, month: str, asof_day: int,
             "upcoming_rows": upcoming_rows, "booked_rows": booked_rows}
 
 
+
 def variable_progress(df: pd.DataFrame, month: str, asof_day: int,
                       total_budget: float, window: int = BASELINE_WINDOW) -> list[dict]:
     """変動費を費目ごとに「いつもより」「枠に対して」の2軸で見る。
@@ -629,23 +630,44 @@ def variable_progress(df: pd.DataFrame, month: str, asof_day: int,
     tot = -full.groupby("sub")["amount"].sum()
     share = tot / tot.sum() if tot.sum() > 0 else tot
 
-    rows = []
-    for sub, act in actual.items():
-        act = float(act)
+    def make(sub: str, act: float, min_share: float) -> dict:
         vals = [float(hist_cum.get((sub, m), 0.0)) for m in ms]
         usual = float(pd.Series(vals).median()) if vals else 0.0
         budget = float(total_budget) * float(share.get(sub, 0.0))
         paced = budget * asof_day / dim
-        rows.append({
+        return {
             "sub": sub, "actual": act, "usual": usual, "vs_usual": act - usual,
             "budget": budget, "paced": paced, "vs_budget": act - paced,
             # 枠が総枠の1%未満だと率が跳ねて意味を持たないので出さない
-            "ratio": (act / paced if paced > 0 and budget >= total_budget * 0.01 else None),
+            "ratio": (act / paced if paced > 0 and budget >= min_share else None),
             "count": int((cur["sub"] == sub).sum()),
-            "months": len(ms),
-        })
+        }
+
+    def total_of(items: list[dict], label: str) -> dict:
+        a = sum(x["actual"] for x in items)
+        u = sum(x["usual"] for x in items)
+        b = sum(x["budget"] for x in items)
+        p = sum(x["paced"] for x in items)
+        return {"sub": label, "actual": a, "usual": u, "vs_usual": a - u,
+                "budget": b, "paced": p, "vs_budget": a - p,
+                "ratio": (a / p if p > 0 else None),
+                "count": sum(x["count"] for x in items)}
+
+    lo = float(total_budget) * 0.01
+    rows = [make(s, float(a), lo) for s, a in actual.items()]
     rows.sort(key=lambda x: -x["vs_usual"])
-    return rows
+
+    # 当月まだ使っていない費目も枠を持っている。一覧から抜くと分母が欠けて
+    # 個別の率だけが跳ね上がるので、まとめて1行に出す
+    spent = set(actual.index)
+    unused = [make(s, 0.0, lo) for s in share.index if s not in spent]
+    unused = [x for x in unused if x["budget"] > 0 or x["usual"] > 0]
+    unused.sort(key=lambda x: -x["budget"])
+
+    return {"rows": rows, "unused": unused,
+            "unused_total": total_of(unused, "まだ使っていない費目"),
+            "total": total_of(rows + unused, "合計"),
+            "months": len(ms), "window": ms}
 
 
 
@@ -1439,14 +1461,14 @@ if role:
                             # 何にいくら使っているか。ペース管理の主目的なので折りたたまない
                             total_budget = r["remain"] + var_paid      # 変動費の総枠（月間）
                             prog = variable_progress(pdf, pace_month, asof_day, total_budget)
-                            if prog:
+                            if prog["rows"]:
                                 st.markdown(f"**変動費の内訳**（{asof_day}日時点・{fyen(var_paid)}）")
                                 st.caption(
-                                    f"「いつも」は過去{prog[0]['months']}ヶ月の同じ日までの累積の中央値。"
+                                    f"「いつも」は過去{prog['months']}ヶ月の同じ日までの累積の中央値。"
                                     f"「枠」は変動費の総枠 {fyen(total_budget)} を過去の使い方で割り振り、"
                                     f"{asof_day}/{dim}日ぶんに縮めたもの（目安）。超過の大きい順。")
-                                cards = []
-                                for x in prog:
+
+                                def vp_card(x, strong=False):
                                     # 過去比に色をつける。金額が小さいうちは色をつけない
                                     d = x["vs_usual"]
                                     big = abs(d) >= 1000
@@ -1459,7 +1481,8 @@ if role:
                                     else:
                                         col = INK
                                     usual_txt = (f'いつも {fyen(x["usual"])} → '
-                                                 f'<b style="color:{col}">{fyen(d) if d < 0 else "+" + fyen(d)}</b>')
+                                                 f'<b style="color:{col}">'
+                                                 f'{fyen(d) if d < 0 else "+" + fyen(d)}</b>')
                                     if x["budget"] <= 0:
                                         budget_txt = "枠なし（新しい支出）"
                                     else:
@@ -1467,17 +1490,36 @@ if role:
                                         pct = f"・{x['ratio']*100:.0f}%" if x["ratio"] is not None else ""
                                         budget_txt = (f'枠 {fyen(x["paced"])}{pct} → '
                                                       f'{fyen(gap) if gap < 0 else "+" + fyen(gap)}')
-                                    cards.append(
-                                        f'<div class="vp"><div class="vp-head">'
-                                        f'<span class="vp-name">{x["sub"]}（{x["count"]}件）</span>'
-                                        f'<span class="vp-amt">{fyen(x["actual"])}</span></div>'
-                                        f'<div class="vp-sub">{usual_txt} ／ {budget_txt}</div></div>')
+                                    cnt = f"（{x['count']}件）" if x["count"] else ""
+                                    style = ' style="background:#FAFAFC"' if strong else ""
+                                    name = f'<b>{x["sub"]}</b>' if strong else x["sub"]
+                                    return (f'<div class="vp"{style}><div class="vp-head">'
+                                            f'<span class="vp-name">{name}{cnt}</span>'
+                                            f'<span class="vp-amt">{fyen(x["actual"])}</span></div>'
+                                            f'<div class="vp-sub">{usual_txt} ／ {budget_txt}</div></div>')
+
+                                cards = [vp_card(x) for x in prog["rows"]]
+                                ut = prog["unused_total"]
+                                if ut["budget"] > 0 or ut["usual"] > 0:
+                                    ut = dict(ut, sub=f"まだ使っていない費目（{len(prog['unused'])}件）",
+                                              count=0)
+                                    cards.append(vp_card(ut))
+                                cards.append(vp_card(prog["total"], strong=True))
                                 st.markdown(f'<div class="vprog">{"".join(cards)}</div>',
                                             unsafe_allow_html=True)
                                 st.caption(
                                     "※ 枠は過去の使い方から割り振った目安です。月ごとの振れが大きいので、"
                                     "判断は「いつもより」を主に見てください。"
-                                    "枠のある費目に限れば、超過額の合計は全体の過不足と一致します。")
+                                    "「いつも」は費目ごとの中央値を足したものなので、合計行は全体の"
+                                    "中央値とは少し違います。")
+
+                                if prog["unused"]:
+                                    with st.expander(f"▼ まだ使っていない費目の内訳（{len(prog['unused'])}件）"):
+                                        html_table(pd.DataFrame([
+                                            {"費目": x["sub"], "月間の枠": fyen(x["budget"]),
+                                             f"{asof_day}日ぶんの枠": fyen(x["paced"]),
+                                             "いつも": fyen(x["usual"])}
+                                            for x in prog["unused"]]))
                             else:
                                 st.caption("この期間の変動費はまだありません。")
 
