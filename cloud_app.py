@@ -206,7 +206,11 @@ def valid_rows(df: pd.DataFrame) -> pd.DataFrame:
 # クラウド版 cloud_app.py にも同じものを置くこと。差し替えるのは as-of 日の求め方だけ。
 # ============================================================
 JST = timezone(timedelta(hours=9))
-CARD_LAG_DAYS = 4          # カード計上遅延。実測値（Amex 3日 / PASMO・Amazon 4日 / 楽天7日）
+# カード計上遅延。バンドルの履歴を復号して「後から何件足されたか」を実測した結果
+# （2026-08-15）、最終取引日の2日前で98.6%が出そろい、3日目・4日目に増える精度は
+# ゼロだった（残る取りこぼしは ¥2,980 で完全に横ばい）。4日だと鮮度を2日捨てるだけ。
+# → 非公開リポジトリの tools/measure_lag.py で測り直せる。変えるときは必ず再測定
+CARD_LAG_DAYS = 2
 BASELINE_WINDOW = 6        # 基準線に使う過去月数
 FREQ_HI, FREQ_LO = 0.9, 0.3  # 出現頻度の分岐（毎月 / 隔月等 / 不定期）
 BONUS_RE = r"賞与|ボーナス"
@@ -444,6 +448,17 @@ def days_in_month(m: str) -> int:
 def prev_months(m: str, n: int) -> list[str]:
     p = pd.Period(m, "M")
     return [str(p - i) for i in range(n, 0, -1)]
+
+
+def last_real_date(df: pd.DataFrame) -> pd.Timestamp | None:
+    """取り込み済み明細の最終日。合成明細は数えない。
+
+    合成明細（年次費用の月割り・相手負担の按分）は実在しない行で、当月まだ
+    落ちていないローンの日付＝未来を持つことがある。データの新しさの根拠から外す。
+    """
+    real = df[~df["id"].astype(str).str.startswith(SYNTHETIC_ID_PREFIXES)]
+    last = pd.to_datetime(real["date"], errors="coerce").max()
+    return None if pd.isna(last) else last
 
 
 def pace_asof(df: pd.DataFrame, month: str, lag: int = CARD_LAG_DAYS,
@@ -1081,6 +1096,13 @@ st.markdown(f"""<style>
     font-variant-numeric: tabular-nums; margin-top: 2px; }}
   .pace-hero .ph-sub {{ color: {SUBTLE}; font-size: 12px; margin-top: 5px;
     line-height: 1.45; }}
+  /* 速報（未確定）は確定より一段弱く見せる。主従が並んで見えると誤読を招く */
+  .pace-hero .ph.prov {{ background: {PAPER}; }}
+  .pace-hero .ph-prov {{ font-size: 22px; font-weight: 600; line-height: 1.25;
+    font-variant-numeric: tabular-nums; margin-top: 2px; color: {SUBTLE}; }}
+  .pace-hero .ph-tag {{ display: inline-block; font-size: 10px; font-weight: 600;
+    padding: 0 5px; margin-left: 6px; border-radius: 3px; vertical-align: 2px;
+    background: #FFF4E5; color: #A45B00; }}
   @media (max-width: 640px) {{
     .pace-hero {{ grid-template-columns: 1fr; }}
     .pace-hero .ph-big {{ font-size: 30px; }}
@@ -1373,10 +1395,25 @@ if role:
                                 if r["income_est"] > 0:
                                     rate_est = (r["income_est"] - land) / r["income_est"] * 100
 
-                            def cell(label, value, sub, color=INK, size="ph-big"):
-                                return (f'<div class="ph"><div class="ph-label">{label}</div>'
+                            def cell(label, value, sub, color=INK, size="ph-big", cls="ph"):
+                                return (f'<div class="{cls}"><div class="ph-label">{label}</div>'
                                         f'<div class="{size}" style="color:{color}">{value}</div>'
                                         f'<div class="ph-sub">{sub}</div></div>')
+
+                            # ---- 速報（最終取引日まで・未確定） ----
+                            # 確定 as-of は安全マージンを取って手前に置くが、それだけだと
+                            # 「1週間前の数字しか見えない」。最終取引日までのぶんも並べて出す。
+                            # ただし未確定なので、確定より一段弱く見せる（主従をはっきりさせる）
+                            # 書き出し時刻も渡すので、速報も「バンドルより新しくは」ならない
+                            prov_day, prov_ts = pace_asof(
+                                pdf, pace_month, lag=0,
+                                exported_at=bundle.get("exported_at"))
+                            prov = None
+                            if prov_day > asof_day:
+                                pr = remaining_budget(pdf, pace_month, prov_day, target, bl)
+                                pr_fixed = sum(x["value"] for x in pr["booked_rows"])
+                                prov = {"day": prov_day, "ts": prov_ts, "r": pr,
+                                        "fixed": pr_fixed, "var": pr["spent"] - pr_fixed}
 
                             # 使った額のうち、自分の裁量で動かせるのは変動費だけ。
                             # 固定費と混ぜて出すと「何にそんなに使ったのか」が分からなくなる
@@ -1427,12 +1464,94 @@ if role:
                                      pace_val, pace_sub, pace_col, "ph-mid")
                                 + cell("このペースでの貯蓄率", rate_val, rate_sub, rate_col, "ph-mid"))
 
-                            st.markdown(f'<div class="pace-hero">{main}{side}</div>',
-                                        unsafe_allow_html=True)
+                            # 速報の1日あたり。暗算させないために画面で出す
+                            prov_cells = ""
+                            if prov and prov["r"]["per_day"]:
+                                pv = prov["r"]["per_day"]
+                                gap2 = pv - (r["per_day"] or 0)
+                                # 月末を跨ぐので日付は Timestamp で足す（day+1 だと31日で壊れる）
+                                p_from = prov["ts"] + pd.Timedelta(days=1)
+                                prov_cells = (
+                                    cell(f'1日あたり（速報 {prov["ts"].month}/{prov["ts"].day}時点）'
+                                         '<span class="ph-tag">未確定</span>',
+                                         fyen(pv),
+                                         f'{p_from.month}/{p_from.day}〜'
+                                         f'{int(pace_month[5:7])}/{dim} の{prov["r"]["left_days"]}日分'
+                                         f'　／　確定ベースとの差 '
+                                         f'{"+" if gap2 >= 0 else "−"}{fyen(abs(gap2))}',
+                                         SUBTLE, "ph-prov", "ph prov")
+                                    + cell('速報で増えたぶん<span class="ph-tag">未確定</span>',
+                                           fyen(prov["r"]["spent"] - r["spent"]),
+                                           f'変動費 {fyen(prov["var"] - var_paid)}'
+                                           f' ／ 固定費 {fyen(prov["fixed"] - fixed_paid)}'
+                                           f'　／　この{prov["day"] - asof_day}日分はまだ増えます',
+                                           SUBTLE, "ph-prov", "ph prov"))
+
+                            st.markdown(
+                                f'<div class="pace-hero">{main}{side}{prov_cells}</div>',
+                                unsafe_allow_html=True)
+                            # 基準日は最新明細より手前に出るので、データが古いと誤解されやすい。
+                            # 「どこまで取り込めているか」を並べて書いて、遅延ぶんだと分かるようにする
+                            imported = last_real_date(pdf)
+                            imported_note = (
+                                f"明細は{imported.month}月{imported.day}日まで取込済み。"
+                                f"カード計上の遅れ{CARD_LAG_DAYS}日分を引いた日を基準にしています"
+                                if imported is not None else
+                                f"カード計上の遅れ{CARD_LAG_DAYS}日分を手前に置いています")
                             st.caption(
                                 f"{month_label(pace_month)}／{asof_ts.month}月{asof_ts.day}日時点のデータ"
-                                f'（{asof_day} / {dim}日経過。カード計上の遅れ{CARD_LAG_DAYS}日分を'
-                                "手前に置いています）")
+                                f"（{asof_day} / {dim}日経過）　:grey[ⓘ {imported_note}]",
+                                help=f"{imported_note}。データが古いのではなく、"
+                                     "カード利用分がMoneyForwardに載るまでの遅れを見込んで"
+                                     "基準日を手前に置いています。")
+
+                            # 速報が確定より大きく出る月がある。理由を読めるようにしておく
+                            if prov and prov["r"]["per_day"] and r["per_day"] \
+                                    and prov["r"]["per_day"] > r["per_day"]:
+                                with st.expander("▼ 速報のほうが1日あたりが大きいのはなぜか"):
+                                    st.markdown(
+                                        f"""
+                                        **as-of を進めても、1日あたりが下がるとは限りません。**
+                                        分子（残り使える額）と分母（残り日数）が同時に動くためです。
+
+                                        | | 確定 {asof_ts.month}/{asof_ts.day} | 速報 {prov['ts'].month}/{prov['ts'].day} |
+                                        |---|---:|---:|
+                                        | 残り使える額 | {fyen(r['remain'])} | {fyen(prov['r']['remain'])} |
+                                        | 残り日数 | {r['left_days']}日 | {prov['r']['left_days']}日 |
+                                        | 1日あたり | {fyen(r['per_day'])} | {fyen(prov['r']['per_day'])} |
+
+                                        この{prov['day'] - asof_day}日で**残り使える額は
+                                        {fyen(abs(r['remain'] - prov['r']['remain']))} しか減っていない**のに、
+                                        残り日数は{prov['day'] - asof_day}日減りました。だから割った結果が
+                                        大きくなります。
+
+                                        使った額は {fyen(prov['r']['spent'] - r['spent'])} 増えていますが、
+                                        その大半は固定費（{fyen(prov['fixed'] - fixed_paid)}）で、
+                                        **「今後落ちる固定費」から「使った額」へ移っただけ**なので
+                                        残り使える額はほとんど動いていません。
+
+                                        **速報はまだ増えます。**実測（2026-08-15）では、最終取引日の
+                                        1日前で約8%、2日前で約1.5%の支出が後から足されました。
+                                        いまの速報値は**低めに出ていると考えてください**。
+                                        """
+                                    )
+
+                            # データの鮮度。クラウドは閲覧専用なので、ローカル版の
+                            # 「取込時刻」ではなくバンドルの書き出し時刻を使う。
+                            # 閲覧者にとってはこちらが正しい（取り込んでも書き出さなければ届かない）
+                            exp_ts = pd.to_datetime(bundle.get("exported_at"), errors="coerce")
+                            if pd.notna(exp_ts):
+                                ago = (pd.Timestamp(datetime.now(JST).date())
+                                       - exp_ts.normalize()).days
+                                txt = (f"最後のデータ更新 {exp_ts.month}月{exp_ts.day}日 "
+                                       f"{exp_ts.strftime('%H:%M')}"
+                                       + (f"（{ago}日前）" if ago > 0 else "（今日）"))
+                                if ago >= 1:
+                                    st.info(
+                                        txt + "。ローカルPCで `update_cloud_data.bat` を実行すると、"
+                                        f"基準日が最大{ago}日ぶん新しくなります。", icon="📥")
+                                else:
+                                    st.caption(txt)
                             if r["irregular_income"] > 0:
                                 st.caption(f"※ 今月は賞与など不定期の入金 {fyen(r['irregular_income'])} が"
                                            "あります（上限には含めていません）")
@@ -1499,7 +1618,8 @@ if role:
                             # ---- 変動費の累積グラフ ----
                             st.subheader("変動費の使い方")
                             st.caption("固定費は日々コントロールできないので、変動費だけで描いています。"
-                                       f"薄い線は過去{len(hist_months)}ヶ月、破線はその中央値。")
+                                       f"薄い線は過去{len(hist_months)}ヶ月、破線はその中央値。"
+                                       + ("点線は速報（未確定・まだ増えます）。" if prov else ""))
                             fig = go.Figure()
                             for m, cum in zip(hist_months, series):
                                 fig.add_trace(go.Scatter(
@@ -1516,6 +1636,16 @@ if role:
                                 name=month_label(pace_month),
                                 line=dict(color=GREEN_600, width=3),
                                 hovertemplate="%{y:,.0f}円<extra>" + month_label(pace_month) + "</extra>"))
+                            if prov:
+                                # 確定〜最終取引日は点線。まだ増えるぶんだと目で分かるようにする
+                                p_cum = variable_cumsum(pdf, pace_month, upto=prov["day"])
+                                seg = [v if asof_day <= i + 1 <= prov["day"] else None
+                                       for i, v in enumerate(p_cum)]
+                                fig.add_trace(go.Scatter(
+                                    x=list(range(1, dim + 1)), y=seg, mode="lines",
+                                    name="速報（未確定）",
+                                    line=dict(color=GREEN_600, width=3, dash="dot"),
+                                    hovertemplate="%{y:,.0f}円<extra>速報（未確定）</extra>"))
                             fig.add_vline(x=asof_day, line=dict(color=SUBTLE, width=1, dash="dot"))
                             fig.update_xaxes(title_text="日", dtick=5, range=[1, 31])
                             st.plotly_chart(base_layout(fig, height=300), width="stretch",
@@ -1590,9 +1720,14 @@ if role:
                                 st.markdown(
                                     f"""
                                     - **as-of 日**: データの最終日から **{CARD_LAG_DAYS}日** 手前。
-                                      カードの計上が遅れるぶん、直近数日は必ず過少に出るため
-                                      （実測: Amex 3日 / モバイルPASMO・Amazon 4日 / 楽天カード 7日）。
-                                      分子（実績）も分母（経過日数）もこの日でそろえています
+                                      カードの計上が遅れるぶん直近数日は歯抜けになるため。
+                                      分子（実績）も分母（経過日数）もこの日でそろえています。
+                                      値は実測で決めています（2日前で98.6%が出そろい、
+                                      3日目・4日目に増える精度はゼロでした）
+                                    - **速報**: 最終取引日までを未確定として併記しています。
+                                      **as-of を進めても1日あたりが下がるとは限りません**
+                                      （分子と分母が同時に動くため）。速報はまだ増えるので
+                                      低めに出ていると考えてください
                                     - **上限**: 経常収入の見込み × {(1-target)*100:.0f}%。
                                       賞与など出現{FREQ_LO*100:.0f}%未満の不定期収入は含めません
                                     - **収入・固定費の見込み**: 基準線（{'・'.join(month_label(m) for m in hist_months)}）
