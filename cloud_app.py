@@ -850,6 +850,173 @@ def category_detail(df: pd.DataFrame, cat: str, month: str, asof_day: int,
                      for s, v in subs.items()]}
 
 
+# ============================================================
+# 階層ナビゲーション（ホームタブのドリルダウン）
+#
+# ホーム → 予算 → 変動費／固定費 → 大項目の詳細 の4階層。1画面に1つのことだけ
+# 出すための仕組みで、MFアプリと同じ構造にそろえている。
+#
+# ⚠️ URL は**初回ロードのときだけ読み、以降は書くだけ**にする。
+# Streamlit 1.58 は URL の変更（popstate）でスクリプトを再実行しない。実測では
+# ブラウザの戻るを押すと **URLだけが変わって画面は据え置き**になる（2026-08-23 検証）。
+# 毎回 URL を読む作りにすると、戻した後の次の操作で画面が突然飛ぶ。
+# **ブラウザの戻る・スマホのスワイプ戻りは効かない前提**で、画面内の戻るボタンを
+# 唯一の導線にすること。URL を書くのはリロード耐性とリンク共有のため。
+# ============================================================
+# クラウドは閲覧専用なので、予算の配分を変えるビュー（ローカル版の
+# NAV_BUDGET_EDIT）は持たない。設定はバンドル越しに来るだけで書き換えられない
+NAV_HOME, NAV_BUDGET, NAV_VAR, NAV_FIXED, NAV_CAT = (
+    "home", "budget", "var", "fixed", "cat")
+
+# 戻る先。パンくずもこれをたどって作る
+NAV_PARENT = {NAV_BUDGET: NAV_HOME, NAV_VAR: NAV_BUDGET, NAV_FIXED: NAV_BUDGET,
+              NAV_CAT: NAV_VAR}
+NAV_LABEL = {NAV_HOME: "ホーム", NAV_BUDGET: "予算", NAV_VAR: "変動費",
+             NAV_FIXED: "固定費", NAV_CAT: "大項目"}
+
+
+def nav_now() -> tuple[str, str]:
+    """(いまのビュー, 選択中の大項目)。URL からの復元は初回ロードの1回だけ。"""
+    if "nav" not in st.session_state:
+        v = st.query_params.get("v", NAV_HOME)
+        st.session_state["nav"] = v if v in NAV_LABEL else NAV_HOME
+        st.session_state["nav_cat"] = st.query_params.get("c", "")
+    return st.session_state["nav"], st.session_state.get("nav_cat", "")
+
+
+def nav_go(view: str, cat: str = "") -> None:
+    """階層を移動する。session_state が正、URL はその写し。"""
+    st.session_state["nav"] = view
+    st.session_state["nav_cat"] = cat
+    # 連番。同じHTMLだと Streamlit が差分なしとみなして再マウントせず、
+    # スクロールのスクリプトが動かない（→ nav_scroll_top）
+    st.session_state["nav_seq"] = st.session_state.get("nav_seq", 0) + 1
+    st.session_state["nav_scroll"] = True
+    st.query_params.from_dict({"v": view, "c": cat} if cat else {"v": view})
+    st.rerun()
+
+
+def nav_scroll_top() -> None:
+    """階層を移動した直後だけ画面を先頭へ戻す。
+
+    Streamlit は再実行してもスクロール位置を保つので、そのままだと遷移先が
+    画面の途中から始まり、見出しも戻るボタンも見えない。
+
+    ⚠️ **毎回やってはいけない。** expander の開閉や基準日の切り替えでも
+    再実行が走るので、無条件に呼ぶと操作のたびに先頭へ飛ばされる。
+    nav_go を通ったときだけ立つフラグで1回だけ実行する。
+
+    実測（2026-08-23）: スクロールするのは `[data-testid="stMain"]` で、
+    window でも document.scrollingElement でもない。
+
+    ⚠️ **1回や数回の setTimeout では効かない。** 遷移後の再描画（特に Plotly）で
+    主スレッドが**数秒ブロックされる**。実測では 200ms 指定の setInterval が
+    1秒に1回しか回らず、スクロール位置の復元はブロックが明けたあと（約5秒後）に
+    起きていた。短い窓で押さえても、その窓が先に閉じる。
+
+    そこで **0 に戻せた状態が続くまで（最長8秒）押さえ続ける**。
+    ユーザーが自分でスクロールしたら即座にやめる（そうしないと操作を奪う）。
+    呼ぶのは描画の**後**（前に置くと復元に負ける）。
+    """
+    if not st.session_state.pop("nav_scroll", False):
+        return
+    # ⚠️ 毎回中身を変える。同じHTMLだと Streamlit が要素を作り直さず、
+    # スクリプトが2回目以降まったく走らない（2026-08-23 に実際に踏んだ）
+    seq = st.session_state.get("nav_seq", 0)
+    st.html(
+        f"<script>/* nav {seq} */"
+        "(() => {"
+        "  let stop = false, settled = 0;"
+        "  const cancel = () => { stop = true; };"
+        "  ['wheel','touchmove'].forEach("
+        "    ev => window.addEventListener(ev, cancel, {once: true, passive: true}));"
+        "  const t0 = performance.now();"
+        "  const iv = setInterval(() => {"
+        "    const el = document.querySelector('[data-testid=\"stMain\"]');"
+        "    if (stop || performance.now() - t0 > 8000) { clearInterval(iv); return; }"
+        "    if (!el) return;"
+        "    if (el.scrollTop === 0) { if (++settled >= 6) clearInterval(iv); }"
+        "    else { settled = 0; el.scrollTop = 0; }"
+        "  }, 100);"
+        "})();"
+        "</script>",
+        unsafe_allow_javascript=True)
+
+
+def nav_trail(view: str, cat: str = "") -> list[tuple[str, str]]:
+    """[(ビュー, 表示名), ...] を浅い順に。パンくずと戻る先に使う。"""
+    out: list[tuple[str, str]] = []
+    v = view
+    while v is not None:
+        out.append((v, cat if (v == NAV_CAT and cat) else NAV_LABEL[v]))
+        v = NAV_PARENT.get(v)
+    return list(reversed(out))
+
+
+def nav_header(view: str, cat: str = "", title: str | None = None) -> None:
+    """階層の見出し。戻るボタンとパンくずを出す。
+
+    戻るボタンは**スマホの親指で押す**ので、幅いっぱい・高さ44px以上を確保する
+    （画面の左上隅は親指が届かない位置なので、狭いリンクにしない）。
+    """
+    trail = nav_trail(view, cat)
+    if len(trail) < 2:
+        return
+    parent, parent_label = trail[-2]
+    with st.container(key="navback"):
+        if st.button(f"‹　{parent_label}へ戻る", key=f"w_back_{view}",
+                     use_container_width=True):
+            nav_go(parent, cat if parent == NAV_CAT else "")
+    # パンくず。表示だけだと深い階層から一発で戻れないので、各段をボタンにする
+    with st.container(horizontal=True, key="navcrumb"):
+        for i, (v, lbl) in enumerate(trail):
+            if i == len(trail) - 1:
+                st.markdown(f"**{lbl}**")      # 現在地は押せない
+                continue
+            if st.button(lbl, key=f"w_crumb_{view}_{i}", type="tertiary"):
+                nav_go(v, cat if v == NAV_CAT else "")
+            st.markdown('<span class="crumb-sep">›</span>', unsafe_allow_html=True)
+    st.markdown(f"### {title or trail[-1][1]}")
+
+
+def bar_gradient(paid_pct: float | None, planned_pct: float | None = None,
+                 over: bool = False) -> str:
+    """バーの塗り分け。濃い＝支払い済み、薄い＝今後落ちる、残りは地の色。
+
+    ⚠️ **空白部分が「残り」と一致すること**が要件。支出だけを塗ると、残額が
+    「予算 − 支出 − 今後落ちる固定費」なのにバーは支出しか見ておらず、
+    バーと数字が別のものを指してしまう（2026-08-23 に実際にそうなっていた）。
+    """
+    p1 = min(100.0, max(0.0, paid_pct or 0.0))
+    p2 = min(100.0, max(p1, planned_pct if planned_pct is not None else p1))
+    dark = ERROR if over else GREEN_600
+    light = "#F3B0B0" if over else GREEN_200
+    return (f"linear-gradient(to right, {dark} 0 {p1:.1f}%, "
+            f"{light} {p1:.1f}% {p2:.1f}%, {LINE} {p2:.1f}% 100%)")
+
+
+def nav_row(key: str, label: str, pct: float | None,
+            pct2: float | None = None, over: bool = False) -> bool:
+    """次の階層へ進む行。行全体がタップ領域になる。
+
+    pct は支払い済み、pct2 は「支払い済み＋今後落ちる」までの累計（省略可）。
+
+    ⚠️ ボタンのラベルは Markdown しか通らない（HTML不可）ので、進捗バーは
+    CSS の ::after で描く。行ごとに1本だけルールを生成する。
+    """
+    cls = f"navrow-{key}"
+    if pct is not None:
+        # ⚠️ 共通ルールが div[class*=...] button::after（詳細度 0,1,2）なので、
+        # 素の .st-key-xxx button::after（0,1,1）だと負けて幅0のままになる。
+        # 属性セレクタとクラスを重ねて詳細度を上げる
+        st.markdown(
+            f'<style>div[class*="st-key-navrow-"].st-key-{cls} button::after '
+            f"{{ width: 100%; background: {bar_gradient(pct, pct2, over)}; }}"
+            "</style>", unsafe_allow_html=True)
+    with st.container(key=cls):
+        return st.button(label, key=f"w_{cls}", use_container_width=True)
+
+
 def variable_cumsum(df: pd.DataFrame, month: str, upto: int | None = None) -> list[float]:
     """変動費の日次累積（1日〜月末）。upto を超える日は None にする。"""
     dim = days_in_month(month)
@@ -1301,6 +1468,123 @@ st.markdown(f"""<style>
   .vprog .vp-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
   .vprog .vp-bar.over i {{ background: {ERROR}; }}
   .vprog .vp.total {{ background: {PAPER}; }}
+  /* ---- 階層ナビゲーション ---- */
+  /* 戻るボタン。スマホの親指で押すので高さ44pxを確保する（狭いリンクにしない） */
+  .st-key-navback button {{ min-height: 44px; justify-content: flex-start;
+    border: none; background: transparent; color: {GREEN_900}; padding-left: 0; }}
+  /* ラベルは navrow と同じくflexで中央に寄るので、左に戻す */
+  .st-key-navback button > div {{ justify-content: flex-start; width: 100%; }}
+  .st-key-navback button p {{ font-size: 14px; font-weight: 600;
+    text-align: left; }}
+  .st-key-navback button:hover {{ background: {GREEN_50}; }}
+  /* 次の階層へ進む行。行全体がタップ領域。バーは ::after で描く
+     （ボタンのラベルにHTMLを入れられないため） */
+  div[class*="st-key-navrow-"] {{ margin-bottom: 8px; }}
+  div[class*="st-key-navrow-"] button {{
+    position: relative; width: 100%; min-height: 76px;
+    padding: 12px 30px 16px 16px; text-align: left; justify-content: flex-start;
+    align-items: flex-start; border: 1px solid {LINE}; border-radius: 10px;
+    background: #FFFFFF; overflow: hidden; }}
+  div[class*="st-key-navrow-"] button:hover {{ border-color: {GREEN_400};
+    background: {GREEN_50}; }}
+  /* 右端の › は擬似要素で足す（ラベルに入れると折り返しで位置がぶれる） */
+  div[class*="st-key-navrow-"] button::before {{ content: "›";
+    position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+    font-size: 20px; color: {GRAY_400}; }}
+  /* 進捗バー。幅と色は行ごとに1本だけルールを生成して当てる */
+  div[class*="st-key-navrow-"] button::after {{ content: "";
+    position: absolute; left: 0; bottom: 0; height: 5px; width: 0;
+    background: {GREEN_600}; }}
+  /* Streamlit はボタンのラベルを flex で中央に寄せる。text-align だけでは
+     効かない（段落が縮んで中央に置かれる）ので、縦積み・左揃えに変える */
+  div[class*="st-key-navrow-"] button > div {{
+    flex-direction: column; align-items: flex-start;
+    justify-content: flex-start; width: 100%; gap: 3px; }}
+  div[class*="st-key-navrow-"] button p {{ text-align: left; width: 100%; }}
+  div[class*="st-key-navrow-"] button p {{ font-size: 13px; line-height: 1.55;
+    font-variant-numeric: tabular-nums; margin: 0; }}
+  div[class*="st-key-navrow-"] button p:first-child {{ font-size: 14px; }}
+  /* ---- 第1階層のカード（収入・支出・収支） ---- */
+  .homecard {{ border: 1px solid {LINE}; border-radius: 12px; background: #FFFFFF;
+    padding: 18px 20px; margin: 4px 0 14px; }}
+  .homecard .hc-ttl {{ font-size: 13px; font-weight: 600; color: {INK}; }}
+  .homecard .hc-ttl span {{ color: {SUBTLE}; font-weight: 400; margin-left: 8px; }}
+  .homecard table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+  .homecard td {{ padding: 7px 0; font-variant-numeric: tabular-nums;
+    border: none; }}
+  .homecard td.k {{ color: {SUBTLE}; font-size: 13px; }}
+  .homecard td.v {{ text-align: right; font-size: 27px; font-weight: 600;
+    line-height: 1.2; white-space: nowrap; }}
+  /* 見通しは実績と性格が違う数字。破線・背景・小見出しの3つで別物だと示し、
+     金額も一段小さくして実績を主に保つ */
+  .homecard .hc-fc {{ margin: 16px -20px -18px; padding: 13px 20px 15px;
+    background: {PAPER}; border-top: 1px dashed {GRAY_400};
+    border-radius: 0 0 12px 12px; }}
+  .homecard .hc-fc .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
+  .homecard .hc-fc table {{ margin-top: 6px; }}
+  .homecard .hc-fc td {{ padding: 5px 0; }}
+  .homecard .hc-fc td.k {{ font-size: 12px; }}
+  .homecard .hc-fc td.v {{ font-size: 20px; }}
+  .homecard .hc-fc .hc-note {{ font-size: 11px; color: {SUBTLE}; margin-top: 7px;
+    line-height: 1.5; }}
+  /* ---- 第2階層の全体バー ---- */
+  .totbar {{ margin: 6px 0 18px; }}
+  .totbar .tb-days {{ text-align: center; font-size: 13px; color: {SUBTLE};
+    margin-bottom: 10px; }}
+  .totbar .tb-days b {{ font-size: 30px; font-weight: 600; color: {INK};
+    margin: 0 4px; }}
+  .totbar .tb-line {{ display: flex; justify-content: space-between;
+    align-items: baseline; font-size: 12px; color: {SUBTLE};
+    font-variant-numeric: tabular-nums; }}
+  .totbar .tb-line b {{ font-size: 26px; font-weight: 600; color: {INK};
+    margin-left: 6px; }}
+  .totbar .tb-bar {{ height: 9px; border-radius: 5px; background: {LINE};
+    margin-top: 9px; overflow: hidden; }}
+  .totbar .tb-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .totbar .tb-bar.over i {{ background: {ERROR}; }}
+  /* ---- パンくず。各段がボタン、現在地だけ素のテキスト ----
+     ボタンと素のテキストが混ざるので、行の高さと余白を両方に同じ値で当てて
+     ベースラインをそろえる（揃えないと区切り記号だけ沈む） */
+  /* ⚠️ ボタンの段と素のテキストの段はラッパーの高さが違い、放っておくと
+     7px ずれる（実測）。すべての直下要素に同じ高さを与えて中央にそろえる */
+  .st-key-navcrumb {{ gap: 0; align-items: center; margin: -4px 0 2px;
+    flex-wrap: wrap; }}
+  .st-key-navcrumb > div,
+  .st-key-navcrumb [data-testid="stMarkdown"],
+  .st-key-navcrumb [data-testid="stElementContainer"] {{
+    display: flex; align-items: center; height: 24px; margin: 0; }}
+  .st-key-navcrumb button {{ min-height: 24px; height: 24px; padding: 0 7px;
+    color: {SUBTLE}; border: none; background: transparent; }}
+  .st-key-navcrumb button:hover {{ color: {GREEN_900}; background: {GREEN_50}; }}
+  .st-key-navcrumb p {{ font-size: 12px; line-height: 24px; margin: 0;
+    color: {SUBTLE}; white-space: nowrap; }}
+  /* stMarkdown の内側に高さ10pxの中間divがあり、そこで沈む（実測）。
+     入れ子のどこかで高さが切れると下にはみ出すので、全段に通す */
+  .st-key-navcrumb [data-testid="stMarkdown"] > div,
+  .st-key-navcrumb [data-testid="stMarkdownContainer"],
+  .st-key-navcrumb [data-testid="stMarkdown"] p {{
+    height: 24px; display: flex; align-items: center; margin: 0; }}
+  /* 現在地（素のテキスト）はボタンと同じ左右余白をとる */
+  .st-key-navcrumb [data-testid="stMarkdown"] p {{ padding: 0 4px; }}
+  .st-key-navcrumb [data-testid="stMarkdown"] strong {{ color: {INK}; }}
+  /* 区切りの › は和文フォントだと低く小さく出るので、欧文側で描く */
+  .st-key-navcrumb .crumb-sep {{ font-family: "Segoe UI", system-ui, sans-serif;
+    font-size: 15px; color: {GRAY_400}; }}
+  /* ---- 結果予想。第2階層でいちばん目立つ要素にする ---- */
+  .forecast {{ border-radius: 12px; background: {GREEN_50};
+    border: 1px solid {GREEN_200}; padding: 18px 20px; margin: 6px 0 20px;
+    display: flex; align-items: center; gap: 16px; }}
+  .forecast.warn {{ background: #FDF0F0; border-color: #F3B0B0; }}
+  .forecast .fc-icon {{ font-size: 38px; line-height: 1; }}
+  .forecast .fc-label {{ font-size: 12px; color: {SUBTLE}; font-weight: 600; }}
+  .forecast .fc-msg {{ font-size: 21px; font-weight: 600; line-height: 1.4;
+    margin-top: 2px; }}
+  .forecast .fc-msg b {{ font-size: 27px; font-variant-numeric: tabular-nums; }}
+  .forecast .fc-note {{ font-size: 12px; color: {SUBTLE}; margin-top: 4px; }}
+  @media (max-width: 640px) {{
+    .forecast .fc-msg {{ font-size: 17px; }}
+    .forecast .fc-msg b {{ font-size: 22px; }}
+  }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
   /* 清算ビューの結論カード。st.metric では値の文字サイズを変えられないため自前で描く */
