@@ -187,11 +187,21 @@ CHART_MONTHS_MOBILE = 12
 
 def is_fixed(df: pd.DataFrame, cats: list[str] | None = None,
              subs: list[str] | None = None) -> pd.Series:
-    """固定費の判定。既定はバンドルの settings.json。ローカル版と同じ。"""
+    """固定費の判定。既定は data/settings.json の設定（画面で変更したものが効く）。
+
+    ここで定数にフォールバックすると、画面で変えた固定費の定義が
+    「今月」タブのペース計算に届かなくなるので、必ず設定を見ること。
+    """
     if cats is None or subs is None:
-        st_ = load_settings()
-        cats = (st_.get("fixed_cats") or FIXED_CATS) if cats is None else cats
-        subs = (st_.get("fixed_subs") or FIXED_SUBS) if subs is None else subs
+        s = load_settings()
+        cats = (s.get("fixed_cats") or FIXED_CATS) if cats is None else cats
+        subs = (s.get("fixed_subs") or FIXED_SUBS) if subs is None else subs
+    # ⚠️ ここは**実績の分類**であって、見込みではない。中項目がサブスク系なら
+    # 契約に紐付くかどうかに関わらず固定費として数える。解約済みのサブスクも
+    # 「払っていた当時は固定費」だったので、過去の分類を今の契約マスタで
+    # 書き換えてはいけない（一度やってしまい、解約済みサービスの過去の請求が
+    # 変動費に付け替わって、変動費の実績が実態より膨らんだ）。
+    # 契約マスタが正なのは**見込み**の側（fixed_amounts / expected_monthly）。
     return (df["amount"] < 0) & (df["cat"].isin(cats) | df["sub"].isin(subs))
 
 
@@ -220,18 +230,119 @@ SHARE_CONTENT = "相手が直接払っている分の自己負担"
 SYNTHETIC_ID_PREFIXES = ("__leveled__", "__share__")   # 実在しない合成明細の目印
 
 
-# 設定はバンドル（settings.json / settlement.json）から来る。
-# バンドル読み込み後に _BUNDLE_SETTINGS / _BUNDLE_SETTLE へ入れる。
+# 設定はバンドル（settings.json / settlement.json / subscriptions.json）から来る。
+# バンドル読み込み後に _BUNDLE_* へ入れる。
 _BUNDLE_SETTINGS: dict = {}
 _BUNDLE_SETTLE: dict = {}
+_BUNDLE_SUBS: dict = {}
 
 
 def load_settings() -> dict:
     return _BUNDLE_SETTINGS
 
 
+def variable_budget_cfg() -> dict:
+    """変動費予算の設定（割合＋手入力の上書き）。"""
+    v = load_settings().get("variable_budget")
+    if not isinstance(v, dict):
+        return {"ratios": {}, "overrides": {}}
+    return {"ratios": dict(v.get("ratios") or {}),
+            "overrides": dict(v.get("overrides") or {})}
+
+def variable_budgets(total: float, cfg: dict | None = None) -> dict[str, float]:
+    """変動費の総額を大項目へ配る。
+
+    **金額ではなく割合で持つ。** 固定費の見込みが動くたびに総額が変わるので、
+    金額で持つと毎回すべて書き直すことになる（固定費の見込みは設定を
+    直すたびに動くため）。
+
+    手入力で上書きした大項目はその額で固定し、**残りを他の費目の割合で按分**する。
+
+    cfg を渡すと保存前の下書きでも同じ配分を試算できる（編集UIのプレビュー用）。
+    """
+    if cfg is None:
+        cfg = variable_budget_cfg()
+    ratios = {k: float(v) for k, v in cfg["ratios"].items() if float(v) > 0}
+    over = {k: float(v) for k, v in cfg["overrides"].items() if str(v) != ""}
+    if not ratios and not over:
+        return {}
+    fixed_sum = sum(over.values())
+    rest = max(0.0, float(total) - fixed_sum)
+    free = {k: v for k, v in ratios.items() if k not in over}
+    denom = sum(free.values())
+    out = dict(over)
+    for k, v in free.items():
+        out[k] = rest * (v / denom) if denom > 0 else 0.0
+    return out
+
+
 def settle_config() -> dict:
     return _BUNDLE_SETTLE
+
+
+def load_subs() -> dict:
+    """サブスクの契約マスタ。クラウドは**閲覧専用**なので読むだけ。
+
+    ⚠️ バンドルに入っていないと level_annual の契約ベースの平準化が効かず、
+    ローカルと数字がずれる（実測で「1日あたり」が2割近くずれた）。
+    バンドルが古くて `subscriptions` が無い場合は空で動くが、そのときは
+    中項目ベース（leveled_subs）だけの計算になる。
+    """
+    d = _BUNDLE_SUBS if isinstance(_BUNDLE_SUBS, dict) else {}
+    return {"fx": d.get("fx") or {}, "items": d.get("items") or [],
+            "ignored": d.get("ignored") or []}
+
+
+def settings_key() -> str:
+    """設定の内容を表す短い文字列。キャッシュキーに混ぜるために使う。
+
+    設定を読む関数を `@st.cache_data` で包むと、設定が変わってもキャッシュが
+    効いたまま古い結果を返す。ローカル版と同じ理由でこちらにも必要。
+    クラウドは「🔄 最新データを取得」でバンドルが差し替わるので、そのときに
+    自動で無効になるよう、バンドル由来の設定から作る。
+    """
+    try:
+        import hashlib
+        import json as _json
+        raw = _json.dumps([_BUNDLE_SETTINGS, _BUNDLE_SUBS],
+                          ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.md5(raw).hexdigest()[:12]
+    except Exception:
+        return ""
+
+
+def sub_monthly(item: dict, fx: dict) -> float:
+    """契約の月額換算（円）。年契約は12で割る。
+
+    外貨はレートを掛けるが、**実績が出ればそちらが正**（MFには請求された円建ての
+    実額が載る）。レートは請求前の見込みにしか効かない。
+    """
+    try:
+        amt = float(item.get("amount") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    cyc = int(item.get("cycle_months") or 1)
+    cyc = cyc if cyc > 0 else 1
+    cur = str(item.get("currency") or "JPY").upper()
+    if cur != "JPY":
+        rate = float((fx.get(cur) or {}).get("rate") or 0)
+        amt *= rate
+    return amt / cyc
+
+
+def sub_active(item: dict) -> bool:
+    """いま課金されている契約か。停止中・解約済みは合計から外す。"""
+    s = str(item.get("status") or "").strip()
+    if s:
+        return s == "利用中"
+    return not str(item.get("ended") or "").strip()   # 旧データ互換
+
+
+def _norm_content(s) -> str:
+    """突き合わせ用に明細の内容をならす。表記ゆれを吸収しすぎない程度に。"""
+    import re as _re
+    t = str(s or "").upper().strip()
+    return _re.sub(r"\s+", " ", t)
 
 
 def leveled_defs() -> dict[str, dict]:
@@ -355,24 +466,82 @@ def split_by_content(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def level_annual(df: pd.DataFrame) -> pd.DataFrame:
-    """年次・複数年の費用を毎月の積立に置き換える（落ちた月だけ突出するのを防ぐ）。"""
+    """年次・複数年の費用を毎月の積立に置き換える（落ちた月だけ突出するのを防ぐ）。
+
+    2方式が併存する。順番に意味があり、**契約ベースを先に**当てる。
+
+    1. **契約ベース**（`data/subscriptions.json`・周期2ヶ月以上）
+       契約マスタに周期が入っているので、そこから月割りできる。中項目に依存しない
+       ので取りこぼさない。こちらを追加するまでは下の中項目ベースだけで、
+       年契約の大半が平準化できず、請求月だけ突出していた。
+    2. **中項目ベース**（`data/settings.json` の `leveled_subs`）
+       火災保険・自動車保険・固定資産税など、契約マスタに載らないものを担当する。
+
+    どちらも**元の明細を必ず落としてから**合成明細を足す（二重計上の防止）。
+    """
+    if df.empty:
+        return df
+    months = sorted(df["month"].unique())
+    rows, drop = [], pd.Series(False, index=df.index)
+    covered: set[str] = set()      # 契約でカバーした中項目
+
+    # ---- 1. 契約ベース ----
+    subs = load_subs()
+    fx = subs.get("fx", {})
+    keyed = df["content"].map(_norm_content)
+    for it in subs.get("items", []):
+        cyc = int(it.get("cycle_months") or 1)
+        if cyc < 2 or not sub_active(it):
+            continue
+        monthly = sub_monthly(it, fx)
+        if monthly <= 0:
+            continue
+        hit = pd.Series(False, index=df.index)
+        for a in (it.get("aliases") or []):
+            cont = a if isinstance(a, str) else a.get("content", "")
+            amt = None if isinstance(a, str) else a.get("amount")
+            m = keyed == _norm_content(cont)
+            if amt not in (None, ""):
+                m &= (-df["amount"] - float(amt)).abs() <= 1
+            hit |= m
+        hit &= df["amount"] < 0
+        if not hit.any():
+            continue                      # 紐付いた実績が無いものは触らない
+        drop |= hit
+        g = df[hit]
+        # 合成明細の中項目は**契約マスタの指定を優先**する。指定が無ければ元の明細に従う。
+        # これで「集計上の中項目」列がそのまま集計の行き先になる
+        cat = str(g["cat"].iloc[-1])
+        sub = str(it.get("mf_sub") or "").strip() or str(g["sub"].iloc[-1])
+        nm = str(it.get("name"))
+        covered.add(sub)
+        for m in months:
+            rows.append({"id": f"__leveled__c_{nm}__{m}", "date": f"{m}-01", "month": m,
+                         "content": f"{LEVELED_CONTENT}（{nm}）", "amount": -monthly,
+                         "inst": "", "cat": cat, "sub": sub, "memo": "",
+                         "calc": 1, "transfer": 0})
+
+    # ---- 2. 中項目ベース（契約が面倒を見ていない中項目だけ） ----
+    # ⚠️ 契約が一部でもカバーしている中項目には当てない。当てると、契約ぶんに加えて
+    # 中項目ぶんの全額が乗って二重計上になる（カード年会費で実際に起きた。解約済み
+    # カードの明細が残っていたせいで、契約の枚数より多い月額が乗った）
     defs = leveled_defs()
-    if not defs or df.empty:
-        return df
-    src = df[df["sub"].isin(defs)]
-    if src.empty:
-        return df
-    months, rows = sorted(df["month"].unique()), []
     for sub, d in defs.items():
-        g = src[src["sub"] == sub]
+        if sub in covered:
+            continue
+        g = df[(df["sub"] == sub) & (~drop)]
         if g.empty or not d["monthly"]:
             continue
+        drop |= (df["sub"] == sub)
         cat = str(g["cat"].iloc[-1])
         for m in months:
             rows.append({"id": f"__leveled__{sub}__{m}", "date": f"{m}-01", "month": m,
                          "content": LEVELED_CONTENT, "amount": -d["monthly"], "inst": "",
                          "cat": cat, "sub": sub, "memo": "", "calc": 1, "transfer": 0})
-    return pd.concat([df[~df["sub"].isin(defs)], pd.DataFrame(rows)], ignore_index=True)
+
+    if not rows:
+        return df
+    return pd.concat([df[~drop], pd.DataFrame(rows)], ignore_index=True)
 
 
 def apply_settlement_share(df: pd.DataFrame) -> pd.DataFrame:
@@ -505,11 +674,19 @@ def _classify(vals: list[float]) -> tuple[str, float]:
 
 @st.cache_data(show_spinner=False)
 def build_baseline(df: pd.DataFrame, month: str, window: int = BASELINE_WINDOW,
-                   start: str | None = None) -> dict:
+                   start: str | None = None, cfg: str = "") -> dict:
     """対象月より前の window ヶ月から中項目ごとの見込みを作る（未来を見ない）。
 
     start を指定すると、それ以前の月は使わない。住み替えで生活水準が変わった
     ときに、前の家のデータが基準線に混ざるのを防ぐ。
+
+    ⚠️ `cfg` は **data/settings.json の中身をキャッシュキーに含めるため**の引数。
+    **先頭に `_` を付けてはいけない。** Streamlit は `_` 始まりの引数をキャッシュキーから
+    除外するので、`_cfg` と名づけると意図と正反対になる（実際に一度やった）。
+    この関数は中で `fixed_amounts()` を読むが、それは引数ではないので、
+    設定を変えてもキャッシュが効いたまま**古い見込みを返し続ける**。
+    2026-08-17 に駐車場の金額を変えても画面が変わらず、原因の切り分けに時間を使った。
+    呼び出し側は `settings_key()` を渡すこと。
     """
     ms = prev_months(month, window)
     if start:
@@ -610,108 +787,67 @@ def remaining_budget(df: pd.DataFrame, month: str, asof_day: int,
 
 
 
-# 変動費の内訳の判定しきい値。色分けと4分類で同じものを使う
-VP_MIN_DIFF = 1000     # これ未満の差は「いつも通り」。1件の買い物で動く額を拾わない
-VP_OVER_RATE = 0.2     # いつもの何割増しから「明確に多い」とみなすか
-VP_TINY_SHARE = 0.01   # 枠が総枠のこの割合未満なら「枠がない」と扱う（率も出さない）
+def category_progress(df: pd.DataFrame, month: str, asof_day: int,
+                      budgets: dict[str, float]) -> list[dict]:
+    """変動費を**大項目**ごとに「予算・支出・残り・1日あたり」で見る。
 
-# 4分類。判定の主軸は「いつも比」で、枠の日割りは「要注意」の第2条件にしか使わない。
-# 月初は日割り枠が誤報を出すため（実データ: 外食はいつも比 −¥313 なのに日割り枠298%、
-# 割り勘（食料品）はいつもより少ないのに170%）。いつも比のゲートを通らないものは赤くしない。
-VP_OUT, VP_WARN, VP_OK_HIGH, VP_OK = "予算外", "要注意", "多いが余裕内", "想定内"
-VP_FOLDED = (VP_OK_HIGH, VP_OK)        # 畳んで1行にまとめる分類
-
-
-def vp_total(items: list[dict], label: str) -> dict:
-    """費目の行をまとめて1行にする（合計行・畳んだ行に使う）。"""
-    a = sum(x["actual"] for x in items)
-    u = sum(x["usual"] for x in items)
-    b = sum(x["budget"] for x in items)
-    p = sum(x["paced"] for x in items)
-    return {"sub": label, "actual": a, "usual": u, "vs_usual": a - u,
-            "budget": b, "paced": p, "vs_budget": a - p,
-            "ratio": (a / p if p > 0 else None),
-            "count": sum(x["count"] for x in items)}
-
-
-def vp_class(x: dict, total_budget: float) -> str:
-    """変動費の1費目を4分類する。金額は変えず、ラベルを付けるだけ。"""
-    d = x["vs_usual"]
-    big = abs(d) >= VP_MIN_DIFF
-    # 過去に実績がなく枠も付いていない＝一時的な支出。枠との比較に意味がない
-    if x["usual"] <= 0 and x["budget"] < float(total_budget) * VP_TINY_SHARE:
-        return VP_OUT if x["actual"] >= VP_MIN_DIFF else VP_OK
-    over_usual = big and (x["usual"] <= 0 or d > x["usual"] * VP_OVER_RATE)
-    if not over_usual:
-        return VP_OK
-    # ここまで来た費目は「いつもより明確に多い」。枠にも余裕がなければ要注意
-    return VP_WARN if x["actual"] > x["paced"] else VP_OK_HIGH
-
-
-def variable_progress(df: pd.DataFrame, month: str, asof_day: int,
-                      total_budget: float, window: int = BASELINE_WINDOW) -> list[dict]:
-    """変動費を費目ごとに「いつもより」「枠に対して」の2軸で見る。
-
-    過去比: 直近 window ヶ月の「同じ日までの累積」の中央値との差。
-      起点（baseline_from）は当てない。住み替えで変わったのは契約で決まる
-      固定費であって、変動費に起点を当てる根拠がないため。実測でも
-      6ヶ月窓の方が起点ありより誤差が小さい（4,699 対 8,789）。
-
-    目標比: 月間の枠を経過割合で按分した額との差。着地の外挿はしない。
-      件数の少ない費目（月2件のチケット代など）で破綻するため、
-      過去比と同じ「as-of 時点同士の比較」にそろえる。
-
-    枠は 総枠 × 過去シェア。枠のある費目に限れば、差の合計は全体の過不足と一致する。
+    中項目は40個近くあって判断に使えないので、MFの大項目（10個前後）にまとめる。
+    予算があるので「いつも比」は要らない（基準が実績しかなかった頃の代用だった）。
     """
     dim = days_in_month(month)
-    have = set(df["month"])
-    ms = [m for m in prev_months(month, window) if m in have]
+    left_days = max(0, dim - asof_day)
     neg = df[df["amount"] < 0]
     var = neg[~is_fixed(neg)]
-
     cur = var[(var["month"] == month) & (var["day"] <= asof_day)]
-    actual = -cur.groupby("sub")["amount"].sum()
-    if actual.empty:
-        return []
+    actual = -cur.groupby("cat")["amount"].sum() if not cur.empty else pd.Series(dtype=float)
 
-    # 過去の「同じ日までの累積」。当月と条件をそろえる
-    hist = var[(var["month"].isin(ms)) & (var["day"] <= asof_day)]
-    hist_cum = -hist.groupby(["sub", "month"])["amount"].sum()
+    out = []
+    # 予算の大きい順。予算のない大項目は末尾へ回す。set の反復順は起動ごとに
+    # 変わるので、同額のときの並びが揺れないよう名前まで含めて決める
+    for cat in sorted(set(budgets) | set(actual.index),
+                      key=lambda c: (-float(budgets.get(c, 0)),
+                                     -float(actual.get(c, 0)), c)):
+        b = float(budgets.get(cat, 0.0))
+        a = float(actual.get(cat, 0.0))
+        left = b - a
+        out.append({
+            "cat": cat, "budget": b, "actual": a, "left": left,
+            "per_day": (left / left_days) if left_days > 0 and left > 0 else 0.0,
+            "pct": (a / b * 100) if b > 0 else None,
+            "count": int((cur["cat"] == cat).sum()) if not cur.empty else 0,
+            "over": b > 0 and left < 0,
+            "no_budget": b <= 0 and a > 0,
+        })
+    return out
 
-    # 枠の配分に使うシェアは月間の合計から出す（月末までの取り分なので）
-    full = var[var["month"].isin(ms)]
-    tot = -full.groupby("sub")["amount"].sum()
-    share = tot / tot.sum() if tot.sum() > 0 else tot
+def category_detail(df: pd.DataFrame, cat: str, month: str, asof_day: int,
+                    months: list[str], prov_day: int | None = None) -> dict:
+    """大項目の詳細。月次推移と、中項目ごとの内訳（金額順）。
 
-    def make(sub: str, act: float, min_share: float) -> dict:
-        vals = [float(hist_cum.get((sub, m), 0.0)) for m in ms]
-        usual = float(pd.Series(vals).median()) if vals else 0.0
-        budget = float(total_budget) * float(share.get(sub, 0.0))
-        paced = budget * asof_day / dim
-        return {
-            "sub": sub, "actual": act, "usual": usual, "vs_usual": act - usual,
-            "budget": budget, "paced": paced, "vs_budget": act - paced,
-            # 枠が総枠の1%未満だと率が跳ねて意味を持たないので出さない
-            "ratio": (act / paced if paced > 0 and budget >= min_share else None),
-            "count": int((cur["sub"] == sub).sum()),
-        }
-
-    lo = float(total_budget) * 0.01
-    rows = [make(s, float(a), lo) for s, a in actual.items()]
-    rows.sort(key=lambda x: -x["vs_usual"])
-
-    # 当月まだ使っていない費目も枠を持っている。一覧から抜くと分母が欠けて
-    # 個別の率だけが跳ね上がるので、まとめて1行に出す
-    spent = set(actual.index)
-    unused = [make(s, 0.0, lo) for s in share.index if s not in spent]
-    unused = [x for x in unused if x["budget"] > 0 or x["usual"] > 0]
-    unused.sort(key=lambda x: -x["budget"])
-
-    return {"rows": rows, "unused": unused,
-            "unused_total": vp_total(unused, "まだ使っていない費目"),
-            "total": vp_total(rows + unused, "合計"),
-            "months": len(ms), "window": ms}
-
+    当月だけ as-of で切るので、過去月（月末まで）とは条件が違う。棒グラフでは
+    その旨を注記する。prov_day を渡すと as-of〜最終取引日ぶんを `prov` に分けて返し、
+    確定と未確定を積み分けられるようにする。
+    """
+    neg = df[df["amount"] < 0]
+    var = neg[~is_fixed(neg)]
+    d = var[var["cat"] == cat]
+    series, prov = {}, {}
+    for m in months:
+        g = d[d["month"] == m]
+        if m == month:
+            g = g[g["day"] <= asof_day]
+        series[m] = float(-g["amount"].sum())
+        prov[m] = 0.0
+    if prov_day and prov_day > asof_day and month in prov:
+        g = d[(d["month"] == month) & (d["day"] > asof_day) & (d["day"] <= prov_day)]
+        prov[month] = float(-g["amount"].sum())
+    cur = d[(d["month"] == month) & (d["day"] <= asof_day)]
+    subs = (-cur.groupby("sub")["amount"].sum()).sort_values(ascending=False) \
+        if not cur.empty else pd.Series(dtype=float)
+    cnt = cur.groupby("sub").size() if not cur.empty else pd.Series(dtype=int)
+    return {"series": series, "prov": prov,
+            "subs": [{"sub": s, "amount": float(v), "count": int(cnt.get(s, 0))}
+                     for s, v in subs.items()]}
 
 
 def variable_cumsum(df: pd.DataFrame, month: str, upto: int | None = None) -> list[float]:
@@ -1158,11 +1294,13 @@ st.markdown(f"""<style>
   .vprog .vp-tag {{ display: inline-block; font-size: 11px; line-height: 1.6;
     padding: 0 6px; margin-right: 6px; border-radius: 3px; font-weight: 600;
     vertical-align: 1px; white-space: nowrap; }}
-  .vprog .vp-tag.warn {{ background: #FDECEC; color: {ERROR}; }}
-  .vprog .vp-tag.out  {{ background: #FFF4E5; color: #A45B00; }}
-  .vprog .vp-tag.ok   {{ background: {PAPER}; color: {SUBTLE}; }}
-  /* 残り＝主表示。実額といつも比は補足に落とす */
-  .vprog .vp-left {{ font-size: 12px; color: {SUBTLE}; }}
+  .vprog .vp-tag {{ background: {PAPER}; color: {SUBTLE}; }}
+  /* 大項目の予算進捗バー。並びは予算順で固定し、超過は色と🔥で拾わせる */
+  .vprog .vp-bar {{ height: 6px; border-radius: 3px; background: {LINE};
+    margin: 6px 0 5px; overflow: hidden; }}
+  .vprog .vp-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .vprog .vp-bar.over i {{ background: {ERROR}; }}
+  .vprog .vp.total {{ background: {PAPER}; }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
   /* 清算ビューの結論カード。st.metric では値の文字サイズを変えられないため自前で描く */
@@ -1291,9 +1429,12 @@ if role:
             chart_months = chart_window(all_months, IS_MOBILE)
             settle = bundle.get("settlement", {})
             settings = bundle.get("settings", {})
-            # ペース計算はローカル版と同じ関数を使う。設定の入口だけバンドルに差し替える
+            # ペース計算はローカル版と同じ関数を使う。設定の入口だけバンドルに差し替える。
+            # subscriptions は 2026-08-23 にバンドルへ追加した。古いバンドルには
+            # 入っていないので、無ければ空（中項目ベースの平準化だけになる）
             _BUNDLE_SETTINGS = settings
             _BUNDLE_SETTLE = settle
+            _BUNDLE_SUBS = bundle.get("subscriptions", {}) or {}
 
             st.sidebar.title("🧾 家計ダッシュボード")
             st.sidebar.caption(f"クラウド版（閲覧専用）\nデータ更新: {bundle.get('exported_at', '不明')}")
@@ -1399,7 +1540,9 @@ if role:
                         asof_day, asof_ts = pace_asof(pdf, pace_month,
                                                           exported_at=bundle.get("exported_at"))
                         dim = days_in_month(pace_month)
-                        bl = build_baseline(pdf, pace_month, BASELINE_WINDOW, bl_start)
+                        # settings_key() を渡さないと、設定を変えてもキャッシュが古い見込みを返す
+                        bl = build_baseline(pdf, pace_month, BASELINE_WINDOW, bl_start,
+                                            settings_key())
 
                         if asof_day < 1:
                             st.info(
@@ -1688,110 +1831,79 @@ if role:
                             st.plotly_chart(base_layout(fig, height=300), width="stretch",
                                             key="pace_var_cum", config=PLOTLY_CONFIG)
 
-                            # 何にいくら使っているか。ペース管理の主目的なので折りたたまない
+                            # 何にいくら使っているか。ペース管理の主目的なので折りたたまない。
+                            # 中項目は40件あって判断に使えないので、MFの大項目にまとめる
                             total_budget = r["remain"] + var_paid      # 変動費の総枠（月間）
-                            prog = variable_progress(pdf, pace_month, asof_day, total_budget)
-                            if prog["rows"]:
+                            budgets = variable_budgets(total_budget)
+                            crows = [x for x in category_progress(pdf, pace_month, asof_day, budgets)
+                                     if x["budget"] > 0 or x["actual"] > 0]
+                            if crows:
+                                ongoing = r["left_days"] > 0
                                 st.markdown(f"**変動費の内訳**（{asof_day}日時点・{fyen(var_paid)}）")
                                 st.caption(
-                                    f"主な数字は**残り**（月間の枠 − 今月の実額）。判定は"
-                                    f"「いつも」（過去{prog['months']}ヶ月の同じ日までの累積の中央値）を"
-                                    "主軸にしています。枠の日割りは月初にぶれるので前面には出しません。")
+                                    f"予算は「使ってよい上限 − 固定費の着地」= {fyen(total_budget)} を"
+                                    "大項目へ割合で配ったもの。"
+                                    + (f"1日あたりは残り{r['left_days']}日で割った額です。" if ongoing
+                                       else "この月はもう終わっているので1日あたりは出しません。"))
 
-                                # 4分類。要チェックだけ上に残し、想定内は1行に畳む
-                                buckets: dict[str, list[dict]] = {VP_OUT: [], VP_WARN: [],
-                                                                  VP_OK_HIGH: [], VP_OK: []}
-                                for x in prog["rows"]:
-                                    buckets[vp_class(x, total_budget)].append(x)
-                                folded = buckets[VP_OK_HIGH] + buckets[VP_OK]
+                                def crow(x, total=False):
+                                    b, a, left = x["budget"], x["actual"], x["left"]
+                                    if x["no_budget"]:
+                                        val, col = fyen(a), SUBTLE
+                                        sub = f'予算なし ／ 支出 {fyen(a)}'
+                                    else:
+                                        val, col = ((f'残り {fyen(left)}', INK) if left >= 0
+                                                    else (f'{fyen(-left)} 超過', ERROR))
+                                        sub = (f'予算 {fyen(b)} ／ 支出 {fyen(a)}'
+                                               + (f' ／ 1日あたり {fyen(x["per_day"])}' if ongoing else "")
+                                               + (f' ／ 進捗 {x["pct"]:.0f}%'
+                                                  if x["pct"] is not None else ""))
+                                    bar = ""
+                                    if b > 0:
+                                        w = min(100.0, max(0.0, x["pct"] or 0.0))
+                                        bar = (f'<div class="vp-bar{" over" if x["over"] else ""}">'
+                                               f'<i style="width:{w:.0f}%"></i></div>')
+                                    name = ("🔥 " if x["over"] else "") + x["cat"]
+                                    if x["no_budget"]:
+                                        name = '<span class="vp-tag">予算未設定</span>' + name
+                                    if total:
+                                        name = f"<b>{name}</b>"
+                                    return (f'<div class="vp{" total" if total else ""}">'
+                                            f'<div class="vp-head"><span class="vp-name">{name}</span>'
+                                            f'<span class="vp-amt" style="color:{col}">{val}</span>'
+                                            f'</div>{bar}<div class="vp-sub">{sub}</div></div>')
 
-                                def left_txt(x):
-                                    """主表示。満月ベースの残りなので月初でも安定する。"""
-                                    if x["budget"] <= 0:
-                                        return "枠なし", SUBTLE
-                                    left = x["budget"] - x["actual"]
-                                    return (f'残り {fyen(left)}' if left >= 0
-                                            else f'枠を {fyen(-left)} 超過'), (INK if left >= 0 else ERROR)
-
-                                def vp_card(x, tag=None, note=None, strong=False):
-                                    val, col = left_txt(x)
-                                    if note is None:
-                                        d = x["vs_usual"]
-                                        if x["usual"] <= 0:
-                                            note = f'いつも ¥0 の費目に {fyen(x["actual"])}'
-                                        else:
-                                            pct = f"（{d / x['usual'] * 100:+.0f}%）"
-                                            word = "多い" if d >= 0 else "少ない"
-                                            note = (f'使った額 {fyen(x["actual"])} ／ '
-                                                    f'いつもより {fyen(abs(d))} {word}{pct}')
-                                    cls = {VP_WARN: "warn", VP_OUT: "out"}.get(tag, "ok")
-                                    badge = f'<span class="vp-tag {cls}">{tag}</span>' if tag else ""
-                                    # 件数は行から落として展開へ。何件かを見て打つ手は変わらない
-                                    style = ' style="background:#FAFAFC"' if strong else ""
-                                    name = f'<b>{x["sub"]}</b>' if strong else x["sub"]
-                                    return (f'<div class="vp"{style}><div class="vp-head">'
-                                            f'<span class="vp-name">{badge}{name}</span>'
-                                            f'<span class="vp-amt" style="color:{col}">{val}</span></div>'
-                                            f'<div class="vp-sub">{note}</div></div>')
-
-                                cards = [vp_card(x, VP_OUT) for x in buckets[VP_OUT]]
-                                cards += [vp_card(x, VP_WARN) for x in buckets[VP_WARN]]
-                                if folded:
-                                    # 畳んだ行も枠と実額を持つので、合計の整合はくずれない
-                                    ft = vp_total(folded, f"{VP_OK}の{len(folded)}費目")
-                                    cards.append(vp_card(ft, VP_OK))
-                                ut = prog["unused_total"]
-                                if ut["budget"] > 0 or ut["usual"] > 0:
-                                    ut = dict(ut, sub=f"まだ使っていない費目（{len(prog['unused'])}件）",
-                                              count=0)
-                                    cards.append(vp_card(ut, note=f'いつも {fyen(ut["usual"])} 使う枠'))
-                                cards.append(vp_card(prog["total"], strong=True,
-                                                     note=f'使った額 {fyen(prog["total"]["actual"])} ／ '
-                                                          f'いつも {fyen(prog["total"]["usual"])}'))
-                                st.markdown(f'<div class="vprog">{"".join(cards)}</div>',
-                                            unsafe_allow_html=True)
+                                tb = sum(x["budget"] for x in crows)
+                                ta = sum(x["actual"] for x in crows)
+                                tleft = tb - ta
+                                ld = r["left_days"]
+                                tot_row = {
+                                    "cat": "合計", "budget": tb, "actual": ta, "left": tleft,
+                                    "per_day": (tleft / ld) if ld > 0 and tleft > 0 else 0.0,
+                                    "pct": (ta / tb * 100) if tb > 0 else None,
+                                    "over": tb > 0 and tleft < 0, "no_budget": False}
+                                st.markdown(
+                                    '<div class="vprog">'
+                                    + "".join(crow(x) for x in crows)
+                                    + crow(tot_row, total=True) + '</div>',
+                                    unsafe_allow_html=True)
                                 st.caption(
-                                    "※ 枠は過去の使い方から割り振った目安で、月ごとの振れが大きいものです。"
-                                    "「いつも」は費目ごとの中央値を足したものなので、合計行は全体の"
-                                    "中央値とは少し違います。")
+                                    "※ 並びは予算の大きい順で固定しています。超過は 🔥 と赤で拾って"
+                                    "ください。「予算未設定」は割合を振っていない大項目で、支出だけを"
+                                    "出しています。")
 
-                                # 消した数字は捨てずにここへ。判定の根拠をたどれるようにする
-                                with st.expander(f"▼ 全費目の詳しい数字（{len(prog['rows'])}件）"):
-                                    order = {VP_OUT: 0, VP_WARN: 1, VP_OK_HIGH: 2, VP_OK: 3}
-                                    detail = sorted(
-                                        ((vp_class(x, total_budget), x) for x in prog["rows"]),
-                                        key=lambda t: (order[t[0]], -t[1]["vs_usual"]))
-                                    html_table(pd.DataFrame([
-                                        {"判定": ("いつも並み〜下回る" if k == VP_OK else k),
-                                         "費目": x["sub"], "件数": f"{x['count']}件",
-                                         "実額": fyen(x["actual"]),
-                                         "いつも": fyen(x["usual"]),
-                                         "いつも比": ("+" if x["vs_usual"] >= 0 else "−")
-                                                     + fyen(abs(x["vs_usual"])),
-                                         "月間の枠": fyen(x["budget"]) if x["budget"] > 0 else "—",
-                                         "残り": (fyen(x["budget"] - x["actual"])
-                                                  if x["budget"] > 0 else "—"),
-                                         f"{asof_day}日ぶんの枠": (fyen(x["paced"])
-                                                                  if x["budget"] > 0 else "—"),
-                                         "枠比": (f"{x['ratio']*100:.0f}%" if x["ratio"] is not None
-                                                  else "—")}
-                                        for k, x in detail]))
-
-                                if prog["unused"]:
-                                    # 「いつもならもう出ているのに今月まだ¥0」の費目だけを出す。
-                                    # いつも¥0 の費目は出ていなくて当たり前なので並べる意味がない
-                                    due = [x for x in prog["unused"] if x["usual"] > 0]
-                                    if due:
-                                        with st.expander(
-                                                f"▼ いつもならもう出ている費目で、今月まだ使っていないもの"
-                                                f"（{len(due)}件）"):
-                                            st.caption(
-                                                f"「いつも」は過去{prog['months']}ヶ月の"
-                                                f"{asof_day}日までの累積の中央値。この額は"
-                                                "これから出てくる可能性があります。")
-                                            html_table(pd.DataFrame([
-                                                {"費目": x["sub"], "いつも": fyen(x["usual"])}
-                                                for x in due]))
+                                for x in crows:
+                                    det = category_detail(pdf, x["cat"], pace_month, asof_day, [pace_month])
+                                    if not det["subs"]:
+                                        continue
+                                    with st.expander(f'▼ {x["cat"]} の内訳（{fyen(x["actual"])}）'):
+                                        sub_tot = sum(s["amount"] for s in det["subs"])
+                                        html_table(pd.DataFrame([
+                                            {"中項目": s["sub"], "金額": fyen(s["amount"]),
+                                              "件数": f'{s["count"]}件',
+                                              "シェア": (f'{s["amount"] / sub_tot * 100:.0f}%'
+                                                         if sub_tot > 0 else "—")}
+                                            for s in det["subs"]]))
                             else:
                                 st.caption("この期間の変動費はまだありません。")
 
