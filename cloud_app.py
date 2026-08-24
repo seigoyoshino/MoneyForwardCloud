@@ -1560,6 +1560,18 @@ st.markdown(f"""<style>
   .homecard .hc-fc td.v {{ font-size: 20px; }}
   .homecard .hc-fc .hc-note {{ font-size: 11px; color: {SUBTLE}; margin-top: 7px;
     line-height: 1.5; }}
+  /* 経常ベースから除いている分。実績でも見通しでもない第3の数字なので、
+     見通し（破線・背景あり）とも区別できるよう実線・背景なしにする */
+  .homecard .hc-ex {{ margin: 0 -20px -18px; padding: 13px 20px 15px;
+    border-top: 1px solid {LINE}; }}
+  .homecard .hc-ex .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
+  .homecard .hc-ex table {{ margin-top: 6px; }}
+  .homecard .hc-ex td {{ padding: 5px 0; }}
+  .homecard .hc-ex td.k {{ font-size: 12px; }}
+  .homecard .hc-ex td.v {{ font-size: 18px; }}
+  .homecard .hc-ex .hc-ytd {{ color: {SUBTLE}; font-size: 11px; margin-left: 6px; }}
+  .homecard .hc-ex .hc-note {{ font-size: 11px; color: {SUBTLE}; margin-top: 7px;
+    line-height: 1.5; }}
   /* ---- 第2階層の全体バー ---- */
   .totbar {{ margin: 6px 0 18px; }}
   .totbar .tb-days {{ text-align: center; font-size: 13px; color: {SUBTLE};
@@ -1817,14 +1829,34 @@ if role:
                 # 第1階層へ、貯蓄率は目標貯蓄率が効く第2階層へ移した
                 # （第1階層に「1画面1つ」を守らせるため。清算・明細タブでも不要）。
                 # kpi / prev は第1階層が使うので計算自体は残す
-                excluded_note = None
+                # 経常ベースで落とした分。**どこにも出ないと実態を見誤る**ので必ず出す。
+                # 上限・使った額・着地見込み・貯蓄率はすべて経常ベース固定で、
+                # 特別な支出も臨時収入も入っていない
+                # ⚠️ period は既に apply_scope 済み。そこから数えると常に 0 になるので
+                # 除外前の valid から数えること
+                excluded = None
                 if exclude_special:
-                    ex_exp = -period.loc[(period["amount"] < 0)
-                                         & period["cat"].isin(SPECIAL_EXP_CATS),
-                                         "amount"].sum()
-                    if ex_exp > 0:
-                        excluded_note = (f"この期間の除外分 — 特別な支出 {fyen(ex_exp)}"
-                                         "（サイドバーのチェックを外すと含まれます）")
+                    def _sp(df):
+                        e = -df.loc[(df["amount"] < 0)
+                                    & df["cat"].isin(SPECIAL_EXP_CATS), "amount"].sum()
+                        i = df.loc[(df["amount"] > 0)
+                                   & df["sub"].isin(SPECIAL_INC_SUBS), "amount"].sum()
+                        return float(e), float(i)
+
+                    if mode == "月":
+                        pv = valid[valid["month"] == sel_month]
+                    elif mode == "年":
+                        pv = valid[valid["month"].str.startswith(sel_year)]
+                    else:
+                        pv = valid
+                    ex_exp, ex_inc = _sp(pv)
+                    cal_year = sel_month[:4] if mode == "月" else None
+                    y_exp = y_inc = None
+                    if cal_year:
+                        y_exp, y_inc = _sp(valid[valid["month"].str.startswith(cal_year)])
+                    if ex_exp > 0 or ex_inc > 0 or (y_exp or 0) > 0 or (y_inc or 0) > 0:
+                        excluded = {"exp": ex_exp, "inc": ex_inc, "year": cal_year,
+                                    "y_exp": y_exp, "y_inc": y_inc}
 
                 tab_now, tab_ov, tab_cat, tab_fix, tab_settle, tab_tx = st.tabs(
                     ["ホーム", "概要", "カテゴリ", "固定費", "清算", "明細"])
@@ -1998,6 +2030,47 @@ if role:
                             # ============================================================
                             # 第1階層 ホーム — 収入・支出・収支だけ。それ以外は下の階層へ
                             # ============================================================
+                            def ex_block():
+                                """経常ベースから除いている分。実績でも見通しでもない第3の数字。
+
+                                ⚠️ **上限・使った額・着地見込み・貯蓄率はすべて経常ベース**で、
+                                特別な支出も臨時収入も入っていない。ここを出さないと、貯蓄率だけを
+                                見て「達成できている」と誤読する。サイドバーを切り替えなくても
+                                額が見えることが要件。
+
+                                支出だけでなく**収入側も必ず並べる**。片側だけ出すと逆方向に
+                                誤解する（月によっては臨時収入のほうがずっと大きい）。
+                                """
+                                if not excluded:
+                                    return ""
+                                e, i = excluded["exp"], excluded["inc"]
+                                yr, ye, yi = excluded["year"], excluded["y_exp"], excluded["y_inc"]
+
+                                def line(label, cur, ytd, sign):
+                                    v = f'{sign}{fyen(cur)}' if cur else "¥0"
+                                    sub = (f'（{yr}年の累計 {sign}{fyen(ytd)}）'
+                                           if ytd else "")
+                                    col = ERROR if (sign == "−" and cur) else (
+                                        GREEN_900 if (sign == "" and cur) else SUBTLE)
+                                    return (f'<tr><td class="k">{label}'
+                                            f'<span class="hc-ytd">{sub}</span></td>'
+                                            f'<td class="v" style="color:{col}">{v}</td></tr>')
+
+                                # 両方を戻した「全体ベース」の収支。実際の手残りに近いのはこちら
+                                real = kpi["balance"] - e + i
+                                return (
+                                    f'<div class="hc-ex"><div class="hc-h">'
+                                    f'経常ベースから除いている分</div><table>'
+                                    + line("特別な支出", e, ye, "−")
+                                    + line(f"臨時収入（{'・'.join(SPECIAL_INC_SUBS)}）", i, yi, "")
+                                    + f'<tr><td class="k"><b>これらを含めた収支</b></td>'
+                                      f'<td class="v"><b>{fyen(real)}</b></td></tr>'
+                                    + '</table><div class="hc-note">'
+                                      '上の収支・見通し・貯蓄率は、いずれもこの分を'
+                                      '<b>除いた</b>経常ベースです。'
+                                      'サイドバーのチェックを外すと全体に切り替わります。'
+                                      '</div></div>')
+
                             def render_home():
                                 # 見通し。実績（上）とは性格が違うので同じ表に並べない。
                                 # ⚠️ 収支はサイドバーのトグルに従う集計、今後落ちる固定費は
@@ -2031,10 +2104,8 @@ if role:
                                     f'<td class="v" style="color:{SHU}">−{fyen(kpi["expense"])}</td></tr>'
                                     f'<tr><td class="k">収支</td>'
                                     f'<td class="v">{fyen(kpi["balance"])}</td></tr>'
-                                    f'</table>{fc}</div>',
+                                    f'</table>{fc}{ex_block()}</div>',
                                     unsafe_allow_html=True)
-                                if excluded_note:
-                                    st.caption(excluded_note)
 
                                 # 予算カード。カード全体がタップ領域（MFのホームと同じ入口）
                                 if r["left_days"] > 0:
