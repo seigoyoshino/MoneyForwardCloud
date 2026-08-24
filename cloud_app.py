@@ -142,13 +142,16 @@ def html_table(df, height: int | None = None, **_ignored):
 PLOTLY_CONFIG = {"displayModeBar": False, "scrollZoom": False}
 
 
-def base_layout(fig: go.Figure, height=320) -> go.Figure:
+def base_layout(fig: go.Figure, height=320, hover="closest") -> go.Figure:
+    """クラウド版の既定は hovermode="closest"。スマホでは "x unified" の
+    まとめ表示が指に対して大きすぎて画面を覆うため、ローカル版と既定が違う。
+    呼び出し側が hover を指定したときだけそれに従う。"""
     fig.update_layout(
         height=height, margin=dict(l=10, r=10, t=24, b=10),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=INK, size=12),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        hovermode="closest",
+        hovermode=hover,
         # 既定の dragmode="zoom" はタッチのドラッグを奪い、グラフ上で縦スクロールできなくなる
         dragmode=False,
     )
@@ -850,6 +853,173 @@ def category_detail(df: pd.DataFrame, cat: str, month: str, asof_day: int,
                      for s, v in subs.items()]}
 
 
+# ============================================================
+# 階層ナビゲーション（ホームタブのドリルダウン）
+#
+# ホーム → 予算 → 変動費／固定費 → 大項目の詳細 の4階層。1画面に1つのことだけ
+# 出すための仕組みで、MFアプリと同じ構造にそろえている。
+#
+# ⚠️ URL は**初回ロードのときだけ読み、以降は書くだけ**にする。
+# Streamlit 1.58 は URL の変更（popstate）でスクリプトを再実行しない。実測では
+# ブラウザの戻るを押すと **URLだけが変わって画面は据え置き**になる（2026-08-23 検証）。
+# 毎回 URL を読む作りにすると、戻した後の次の操作で画面が突然飛ぶ。
+# **ブラウザの戻る・スマホのスワイプ戻りは効かない前提**で、画面内の戻るボタンを
+# 唯一の導線にすること。URL を書くのはリロード耐性とリンク共有のため。
+# ============================================================
+# クラウドは閲覧専用なので、予算の配分を変えるビュー（ローカル版の
+# NAV_BUDGET_EDIT）は持たない。設定はバンドル越しに来るだけで書き換えられない
+NAV_HOME, NAV_BUDGET, NAV_VAR, NAV_FIXED, NAV_CAT = (
+    "home", "budget", "var", "fixed", "cat")
+
+# 戻る先。パンくずもこれをたどって作る
+NAV_PARENT = {NAV_BUDGET: NAV_HOME, NAV_VAR: NAV_BUDGET, NAV_FIXED: NAV_BUDGET,
+              NAV_CAT: NAV_VAR}
+NAV_LABEL = {NAV_HOME: "ホーム", NAV_BUDGET: "予算", NAV_VAR: "変動費",
+             NAV_FIXED: "固定費", NAV_CAT: "大項目"}
+
+
+def nav_now() -> tuple[str, str]:
+    """(いまのビュー, 選択中の大項目)。URL からの復元は初回ロードの1回だけ。"""
+    if "nav" not in st.session_state:
+        v = st.query_params.get("v", NAV_HOME)
+        st.session_state["nav"] = v if v in NAV_LABEL else NAV_HOME
+        st.session_state["nav_cat"] = st.query_params.get("c", "")
+    return st.session_state["nav"], st.session_state.get("nav_cat", "")
+
+
+def nav_go(view: str, cat: str = "") -> None:
+    """階層を移動する。session_state が正、URL はその写し。"""
+    st.session_state["nav"] = view
+    st.session_state["nav_cat"] = cat
+    # 連番。同じHTMLだと Streamlit が差分なしとみなして再マウントせず、
+    # スクロールのスクリプトが動かない（→ nav_scroll_top）
+    st.session_state["nav_seq"] = st.session_state.get("nav_seq", 0) + 1
+    st.session_state["nav_scroll"] = True
+    st.query_params.from_dict({"v": view, "c": cat} if cat else {"v": view})
+    st.rerun()
+
+
+def nav_scroll_top() -> None:
+    """階層を移動した直後だけ画面を先頭へ戻す。
+
+    Streamlit は再実行してもスクロール位置を保つので、そのままだと遷移先が
+    画面の途中から始まり、見出しも戻るボタンも見えない。
+
+    ⚠️ **毎回やってはいけない。** expander の開閉や基準日の切り替えでも
+    再実行が走るので、無条件に呼ぶと操作のたびに先頭へ飛ばされる。
+    nav_go を通ったときだけ立つフラグで1回だけ実行する。
+
+    実測（2026-08-23）: スクロールするのは `[data-testid="stMain"]` で、
+    window でも document.scrollingElement でもない。
+
+    ⚠️ **1回や数回の setTimeout では効かない。** 遷移後の再描画（特に Plotly）で
+    主スレッドが**数秒ブロックされる**。実測では 200ms 指定の setInterval が
+    1秒に1回しか回らず、スクロール位置の復元はブロックが明けたあと（約5秒後）に
+    起きていた。短い窓で押さえても、その窓が先に閉じる。
+
+    そこで **0 に戻せた状態が続くまで（最長8秒）押さえ続ける**。
+    ユーザーが自分でスクロールしたら即座にやめる（そうしないと操作を奪う）。
+    呼ぶのは描画の**後**（前に置くと復元に負ける）。
+    """
+    if not st.session_state.pop("nav_scroll", False):
+        return
+    # ⚠️ 毎回中身を変える。同じHTMLだと Streamlit が要素を作り直さず、
+    # スクリプトが2回目以降まったく走らない（2026-08-23 に実際に踏んだ）
+    seq = st.session_state.get("nav_seq", 0)
+    st.html(
+        f"<script>/* nav {seq} */"
+        "(() => {"
+        "  let stop = false, settled = 0;"
+        "  const cancel = () => { stop = true; };"
+        "  ['wheel','touchmove'].forEach("
+        "    ev => window.addEventListener(ev, cancel, {once: true, passive: true}));"
+        "  const t0 = performance.now();"
+        "  const iv = setInterval(() => {"
+        "    const el = document.querySelector('[data-testid=\"stMain\"]');"
+        "    if (stop || performance.now() - t0 > 8000) { clearInterval(iv); return; }"
+        "    if (!el) return;"
+        "    if (el.scrollTop === 0) { if (++settled >= 6) clearInterval(iv); }"
+        "    else { settled = 0; el.scrollTop = 0; }"
+        "  }, 100);"
+        "})();"
+        "</script>",
+        unsafe_allow_javascript=True)
+
+
+def nav_trail(view: str, cat: str = "") -> list[tuple[str, str]]:
+    """[(ビュー, 表示名), ...] を浅い順に。パンくずと戻る先に使う。"""
+    out: list[tuple[str, str]] = []
+    v = view
+    while v is not None:
+        out.append((v, cat if (v == NAV_CAT and cat) else NAV_LABEL[v]))
+        v = NAV_PARENT.get(v)
+    return list(reversed(out))
+
+
+def nav_header(view: str, cat: str = "", title: str | None = None) -> None:
+    """階層の見出し。戻るボタンとパンくずを出す。
+
+    戻るボタンは**スマホの親指で押す**ので、幅いっぱい・高さ44px以上を確保する
+    （画面の左上隅は親指が届かない位置なので、狭いリンクにしない）。
+    """
+    trail = nav_trail(view, cat)
+    if len(trail) < 2:
+        return
+    parent, parent_label = trail[-2]
+    with st.container(key="navback"):
+        if st.button(f"‹　{parent_label}へ戻る", key=f"w_back_{view}",
+                     use_container_width=True):
+            nav_go(parent, cat if parent == NAV_CAT else "")
+    # パンくず。表示だけだと深い階層から一発で戻れないので、各段をボタンにする
+    with st.container(horizontal=True, key="navcrumb"):
+        for i, (v, lbl) in enumerate(trail):
+            if i == len(trail) - 1:
+                st.markdown(f"**{lbl}**")      # 現在地は押せない
+                continue
+            if st.button(lbl, key=f"w_crumb_{view}_{i}", type="tertiary"):
+                nav_go(v, cat if v == NAV_CAT else "")
+            st.markdown('<span class="crumb-sep">›</span>', unsafe_allow_html=True)
+    st.markdown(f"### {title or trail[-1][1]}")
+
+
+def bar_gradient(paid_pct: float | None, planned_pct: float | None = None,
+                 over: bool = False) -> str:
+    """バーの塗り分け。濃い＝支払い済み、薄い＝今後落ちる、残りは地の色。
+
+    ⚠️ **空白部分が「残り」と一致すること**が要件。支出だけを塗ると、残額が
+    「予算 − 支出 − 今後落ちる固定費」なのにバーは支出しか見ておらず、
+    バーと数字が別のものを指してしまう（2026-08-23 に実際にそうなっていた）。
+    """
+    p1 = min(100.0, max(0.0, paid_pct or 0.0))
+    p2 = min(100.0, max(p1, planned_pct if planned_pct is not None else p1))
+    dark = ERROR if over else GREEN_600
+    light = "#F3B0B0" if over else GREEN_200
+    return (f"linear-gradient(to right, {dark} 0 {p1:.1f}%, "
+            f"{light} {p1:.1f}% {p2:.1f}%, {LINE} {p2:.1f}% 100%)")
+
+
+def nav_row(key: str, label: str, pct: float | None,
+            pct2: float | None = None, over: bool = False) -> bool:
+    """次の階層へ進む行。行全体がタップ領域になる。
+
+    pct は支払い済み、pct2 は「支払い済み＋今後落ちる」までの累計（省略可）。
+
+    ⚠️ ボタンのラベルは Markdown しか通らない（HTML不可）ので、進捗バーは
+    CSS の ::after で描く。行ごとに1本だけルールを生成する。
+    """
+    cls = f"navrow-{key}"
+    if pct is not None:
+        # ⚠️ 共通ルールが div[class*=...] button::after（詳細度 0,1,2）なので、
+        # 素の .st-key-xxx button::after（0,1,1）だと負けて幅0のままになる。
+        # 属性セレクタとクラスを重ねて詳細度を上げる
+        st.markdown(
+            f'<style>div[class*="st-key-navrow-"].st-key-{cls} button::after '
+            f"{{ width: 100%; background: {bar_gradient(pct, pct2, over)}; }}"
+            "</style>", unsafe_allow_html=True)
+    with st.container(key=cls):
+        return st.button(label, key=f"w_{cls}", use_container_width=True)
+
+
 def variable_cumsum(df: pd.DataFrame, month: str, upto: int | None = None) -> list[float]:
     """変動費の日次累積（1日〜月末）。upto を超える日は None にする。"""
     dim = days_in_month(month)
@@ -1301,6 +1471,123 @@ st.markdown(f"""<style>
   .vprog .vp-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
   .vprog .vp-bar.over i {{ background: {ERROR}; }}
   .vprog .vp.total {{ background: {PAPER}; }}
+  /* ---- 階層ナビゲーション ---- */
+  /* 戻るボタン。スマホの親指で押すので高さ44pxを確保する（狭いリンクにしない） */
+  .st-key-navback button {{ min-height: 44px; justify-content: flex-start;
+    border: none; background: transparent; color: {GREEN_900}; padding-left: 0; }}
+  /* ラベルは navrow と同じくflexで中央に寄るので、左に戻す */
+  .st-key-navback button > div {{ justify-content: flex-start; width: 100%; }}
+  .st-key-navback button p {{ font-size: 14px; font-weight: 600;
+    text-align: left; }}
+  .st-key-navback button:hover {{ background: {GREEN_50}; }}
+  /* 次の階層へ進む行。行全体がタップ領域。バーは ::after で描く
+     （ボタンのラベルにHTMLを入れられないため） */
+  div[class*="st-key-navrow-"] {{ margin-bottom: 8px; }}
+  div[class*="st-key-navrow-"] button {{
+    position: relative; width: 100%; min-height: 76px;
+    padding: 12px 30px 16px 16px; text-align: left; justify-content: flex-start;
+    align-items: flex-start; border: 1px solid {LINE}; border-radius: 10px;
+    background: #FFFFFF; overflow: hidden; }}
+  div[class*="st-key-navrow-"] button:hover {{ border-color: {GREEN_400};
+    background: {GREEN_50}; }}
+  /* 右端の › は擬似要素で足す（ラベルに入れると折り返しで位置がぶれる） */
+  div[class*="st-key-navrow-"] button::before {{ content: "›";
+    position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+    font-size: 20px; color: {GRAY_400}; }}
+  /* 進捗バー。幅と色は行ごとに1本だけルールを生成して当てる */
+  div[class*="st-key-navrow-"] button::after {{ content: "";
+    position: absolute; left: 0; bottom: 0; height: 5px; width: 0;
+    background: {GREEN_600}; }}
+  /* Streamlit はボタンのラベルを flex で中央に寄せる。text-align だけでは
+     効かない（段落が縮んで中央に置かれる）ので、縦積み・左揃えに変える */
+  div[class*="st-key-navrow-"] button > div {{
+    flex-direction: column; align-items: flex-start;
+    justify-content: flex-start; width: 100%; gap: 3px; }}
+  div[class*="st-key-navrow-"] button p {{ text-align: left; width: 100%; }}
+  div[class*="st-key-navrow-"] button p {{ font-size: 13px; line-height: 1.55;
+    font-variant-numeric: tabular-nums; margin: 0; }}
+  div[class*="st-key-navrow-"] button p:first-child {{ font-size: 14px; }}
+  /* ---- 第1階層のカード（収入・支出・収支） ---- */
+  .homecard {{ border: 1px solid {LINE}; border-radius: 12px; background: #FFFFFF;
+    padding: 18px 20px; margin: 4px 0 14px; }}
+  .homecard .hc-ttl {{ font-size: 13px; font-weight: 600; color: {INK}; }}
+  .homecard .hc-ttl span {{ color: {SUBTLE}; font-weight: 400; margin-left: 8px; }}
+  .homecard table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+  .homecard td {{ padding: 7px 0; font-variant-numeric: tabular-nums;
+    border: none; }}
+  .homecard td.k {{ color: {SUBTLE}; font-size: 13px; }}
+  .homecard td.v {{ text-align: right; font-size: 27px; font-weight: 600;
+    line-height: 1.2; white-space: nowrap; }}
+  /* 見通しは実績と性格が違う数字。破線・背景・小見出しの3つで別物だと示し、
+     金額も一段小さくして実績を主に保つ */
+  .homecard .hc-fc {{ margin: 16px -20px -18px; padding: 13px 20px 15px;
+    background: {PAPER}; border-top: 1px dashed {GRAY_400};
+    border-radius: 0 0 12px 12px; }}
+  .homecard .hc-fc .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
+  .homecard .hc-fc table {{ margin-top: 6px; }}
+  .homecard .hc-fc td {{ padding: 5px 0; }}
+  .homecard .hc-fc td.k {{ font-size: 12px; }}
+  .homecard .hc-fc td.v {{ font-size: 20px; }}
+  .homecard .hc-fc .hc-note {{ font-size: 11px; color: {SUBTLE}; margin-top: 7px;
+    line-height: 1.5; }}
+  /* ---- 第2階層の全体バー ---- */
+  .totbar {{ margin: 6px 0 18px; }}
+  .totbar .tb-days {{ text-align: center; font-size: 13px; color: {SUBTLE};
+    margin-bottom: 10px; }}
+  .totbar .tb-days b {{ font-size: 30px; font-weight: 600; color: {INK};
+    margin: 0 4px; }}
+  .totbar .tb-line {{ display: flex; justify-content: space-between;
+    align-items: baseline; font-size: 12px; color: {SUBTLE};
+    font-variant-numeric: tabular-nums; }}
+  .totbar .tb-line b {{ font-size: 26px; font-weight: 600; color: {INK};
+    margin-left: 6px; }}
+  .totbar .tb-bar {{ height: 9px; border-radius: 5px; background: {LINE};
+    margin-top: 9px; overflow: hidden; }}
+  .totbar .tb-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .totbar .tb-bar.over i {{ background: {ERROR}; }}
+  /* ---- パンくず。各段がボタン、現在地だけ素のテキスト ----
+     ボタンと素のテキストが混ざるので、行の高さと余白を両方に同じ値で当てて
+     ベースラインをそろえる（揃えないと区切り記号だけ沈む） */
+  /* ⚠️ ボタンの段と素のテキストの段はラッパーの高さが違い、放っておくと
+     7px ずれる（実測）。すべての直下要素に同じ高さを与えて中央にそろえる */
+  .st-key-navcrumb {{ gap: 0; align-items: center; margin: -4px 0 2px;
+    flex-wrap: wrap; }}
+  .st-key-navcrumb > div,
+  .st-key-navcrumb [data-testid="stMarkdown"],
+  .st-key-navcrumb [data-testid="stElementContainer"] {{
+    display: flex; align-items: center; height: 24px; margin: 0; }}
+  .st-key-navcrumb button {{ min-height: 24px; height: 24px; padding: 0 7px;
+    color: {SUBTLE}; border: none; background: transparent; }}
+  .st-key-navcrumb button:hover {{ color: {GREEN_900}; background: {GREEN_50}; }}
+  .st-key-navcrumb p {{ font-size: 12px; line-height: 24px; margin: 0;
+    color: {SUBTLE}; white-space: nowrap; }}
+  /* stMarkdown の内側に高さ10pxの中間divがあり、そこで沈む（実測）。
+     入れ子のどこかで高さが切れると下にはみ出すので、全段に通す */
+  .st-key-navcrumb [data-testid="stMarkdown"] > div,
+  .st-key-navcrumb [data-testid="stMarkdownContainer"],
+  .st-key-navcrumb [data-testid="stMarkdown"] p {{
+    height: 24px; display: flex; align-items: center; margin: 0; }}
+  /* 現在地（素のテキスト）はボタンと同じ左右余白をとる */
+  .st-key-navcrumb [data-testid="stMarkdown"] p {{ padding: 0 4px; }}
+  .st-key-navcrumb [data-testid="stMarkdown"] strong {{ color: {INK}; }}
+  /* 区切りの › は和文フォントだと低く小さく出るので、欧文側で描く */
+  .st-key-navcrumb .crumb-sep {{ font-family: "Segoe UI", system-ui, sans-serif;
+    font-size: 15px; color: {GRAY_400}; }}
+  /* ---- 結果予想。第2階層でいちばん目立つ要素にする ---- */
+  .forecast {{ border-radius: 12px; background: {GREEN_50};
+    border: 1px solid {GREEN_200}; padding: 18px 20px; margin: 6px 0 20px;
+    display: flex; align-items: center; gap: 16px; }}
+  .forecast.warn {{ background: #FDF0F0; border-color: #F3B0B0; }}
+  .forecast .fc-icon {{ font-size: 38px; line-height: 1; }}
+  .forecast .fc-label {{ font-size: 12px; color: {SUBTLE}; font-weight: 600; }}
+  .forecast .fc-msg {{ font-size: 21px; font-weight: 600; line-height: 1.4;
+    margin-top: 2px; }}
+  .forecast .fc-msg b {{ font-size: 27px; font-variant-numeric: tabular-nums; }}
+  .forecast .fc-note {{ font-size: 12px; color: {SUBTLE}; margin-top: 4px; }}
+  @media (max-width: 640px) {{
+    .forecast .fc-msg {{ font-size: 17px; }}
+    .forecast .fc-msg b {{ font-size: 22px; }}
+  }}
   div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
       border-radius:8px; padding:12px 16px; }}
   /* 清算ビューの結論カード。st.metric では値の文字サイズを変えられないため自前で描く */
@@ -1494,21 +1781,21 @@ if role:
 
                 st.caption(f"表示期間: **{period_label}** ／ {'経常ベース' if exclude_special else '全体'}"
                            + ("・割り勘相殺" if net_warikan else ""))
-                c1, c2 = st.columns(2)
-                d = ((kpi["income"] - prev["income"]) / abs(prev["income"]) * 100
-                     if prev and prev["income"] else None)
-                c1.metric("収入", fyen(kpi["income"]), f"{d:+.1f}% 前月比" if d is not None else None)
-                d = ((kpi["expense"] - prev["expense"]) / abs(prev["expense"]) * 100
-                     if prev and prev["expense"] else None)
-                c2.metric("支出", fyen(kpi["expense"]), f"{d:+.1f}% 前月比" if d is not None else None,
-                          delta_color="inverse")
-                c3, c4 = st.columns(2)
-                c3.metric(f"収支（{'黒字' if kpi['balance'] >= 0 else '赤字'}）", fyen(kpi["balance"]),
-                          f"前月 {fyen(prev['balance'])}" if prev else None, delta_color="off")
-                c4.metric("貯蓄率", f"{kpi['rate']:.1f}%" if kpi["rate"] is not None else "—")
+                # タブの上に常時KPIを出すのはやめた。収入・支出・収支はホームの
+                # 第1階層へ、貯蓄率は目標貯蓄率が効く第2階層へ移した
+                # （第1階層に「1画面1つ」を守らせるため。清算・明細タブでも不要）。
+                # kpi / prev は第1階層が使うので計算自体は残す
+                excluded_note = None
+                if exclude_special:
+                    ex_exp = -period.loc[(period["amount"] < 0)
+                                         & period["cat"].isin(SPECIAL_EXP_CATS),
+                                         "amount"].sum()
+                    if ex_exp > 0:
+                        excluded_note = (f"この期間の除外分 — 特別な支出 {fyen(ex_exp)}"
+                                         "（サイドバーのチェックを外すと含まれます）")
 
                 tab_now, tab_ov, tab_cat, tab_fix, tab_settle, tab_tx = st.tabs(
-                    ["今月", "概要", "カテゴリ", "固定費", "清算", "明細"])
+                    ["ホーム", "概要", "カテゴリ", "固定費", "清算", "明細"])
 
                 monthly = []
                 grouped = dict(tuple(scoped_all.groupby("month")))
@@ -1551,13 +1838,38 @@ if role:
                                 f"{CARD_LAG_DAYS + 4}日目ごろから表示できます。"
                             )
                         else:
-                            r = remaining_budget(pdf, pace_month, asof_day, target, bl)
+                            # ============================================================
+                            # ペース計算の共通部分。ここで作った数字を第1〜4階層が共有する
+                            # ============================================================
+                            prov_day, prov_ts = pace_asof(
+                                pdf, pace_month, lag=0,
+                                exported_at=bundle.get("exported_at"))
+                            has_prov_day = prov_day > asof_day
+
+                            # ---- 基準日の選択（確定 / 速報）----
+                            # 以前は確定4セルと速報2セルを同時に出していた。これが画面が
+                            # 膨らむ最大の原因だったので切り替え式にする。選んだ基準日は
+                            # 第2〜4階層すべてに効くので、どの階層でも数字がそろう。
+                            # ⚠️ ウィジェットより前に session_state を読む。第2階層で描くより
+                            # 手前でこの値が要るため（初回は既定の「確定」になる）
+                            use_prov = (has_prov_day
+                                        and st.session_state.get("w_asof_mode") == "速報")
+                            cur_day = prov_day if use_prov else asof_day
+                            cur_ts = prov_ts if use_prov else asof_ts
+
+                            r = remaining_budget(pdf, pace_month, cur_day, target, bl)
                             over = r["remain"] < 0
 
-                            # ---- 表示に使う数字をここでまとめて作る（計算は変えない） ----
-                            # 残り日数は as-of の翌日から月末まで。カレンダー上の「今日」より
+                            # 「速報のほうが1日あたりが大きい」の説明に両方が要る
+                            r_fix = (remaining_budget(pdf, pace_month, asof_day, target, bl)
+                                     if use_prov else r)
+                            r_prov = (r if use_prov else
+                                      (remaining_budget(pdf, pace_month, prov_day, target, bl)
+                                       if has_prov_day else None))
+
+                            # 残り日数は基準日の翌日から月末まで。カレンダー上の「今日」より
                             # 数日ぶん多いので、日数だけでなく期間も出して誤解を避ける
-                            span_from = asof_ts + pd.Timedelta(days=1)
+                            span_from = cur_ts + pd.Timedelta(days=1)
                             span = (f"{span_from.month}月{span_from.day}日〜"
                                     f"{int(pace_month[5:7])}月{dim}日の{r['left_days']}日分")
 
@@ -1565,111 +1877,45 @@ if role:
                             series = [variable_cumsum(pdf, m) for m in hist_months]
                             med = [float(pd.Series([s[i] for s in series if i < len(s)]).median())
                                    for i in range(31)]
-                            cur_cum = variable_cumsum(pdf, pace_month, upto=asof_day)
+                            cur_cum = variable_cumsum(pdf, pace_month, upto=cur_day)
                             v_now = next((v for v in reversed(cur_cum) if v is not None), 0.0)
-                            v_med = med[min(asof_day, 31) - 1]
+                            v_med = med[min(cur_day, 31) - 1]
 
                             land = rate_est = None
-                            if asof_day >= CARD_LAG_DAYS + 4:
-                                land = forecast_landing(pdf, pace_month, asof_day, bl)
+                            if cur_day >= CARD_LAG_DAYS + 4:
+                                land = forecast_landing(pdf, pace_month, cur_day, bl)
                                 if r["income_est"] > 0:
                                     rate_est = (r["income_est"] - land) / r["income_est"] * 100
+
+                            # 使った額のうち、自分の裁量で動かせるのは変動費だけ。
+                            # 固定費と混ぜて出すと「何にそんなに使ったのか」が分からなくなる
+                            fixed_paid = sum(x["value"] for x in r["booked_rows"])
+                            var_paid = r["spent"] - fixed_paid
+
+                            # 固定費の着地。「見込み」と書くと基準線の月額見込みと混同されるので、
+                            # ここは**今月の着地**（実績＋これから落ちるぶん）と呼ぶ
+                            fx_land = fixed_paid + r["upcoming"]
+                            fx_plan = sum(d["value"] for s, d in bl["exp"].items()
+                                          if s in set(pdf.loc[is_fixed(pdf), "sub"].unique()))
+                            fx_gap = fx_land - fx_plan
+
+                            total_budget = r["remain"] + var_paid      # 変動費の総枠（月間）
+                            budgets = variable_budgets(total_budget)
+                            crows = [x for x in category_progress(pdf, pace_month, cur_day, budgets)
+                                     if x["budget"] > 0 or x["actual"] > 0]
+                            var_budget = sum(x["budget"] for x in crows)
+                            var_pct = (var_paid / var_budget * 100) if var_budget > 0 else None
+                            fix_pct = (fixed_paid / fx_land * 100) if fx_land > 0 else None
+
+                            # 月全体の上限と着地の見通し。第1・第2階層の見出しに使う
+                            cap_pct = (r["spent"] / r["cap"] * 100) if r["cap"] > 0 else None
+                            landing_over = (land - r["cap"]) if land is not None else None
 
                             def cell(label, value, sub, color=INK, size="ph-big", cls="ph"):
                                 return (f'<div class="{cls}"><div class="ph-label">{label}</div>'
                                         f'<div class="{size}" style="color:{color}">{value}</div>'
                                         f'<div class="ph-sub">{sub}</div></div>')
 
-                            # ---- 速報（最終取引日まで・未確定） ----
-                            # 確定 as-of は安全マージンを取って手前に置くが、それだけだと
-                            # 「1週間前の数字しか見えない」。最終取引日までのぶんも並べて出す。
-                            # ただし未確定なので、確定より一段弱く見せる（主従をはっきりさせる）
-                            # 書き出し時刻も渡すので、速報も「バンドルより新しくは」ならない
-                            prov_day, prov_ts = pace_asof(
-                                pdf, pace_month, lag=0,
-                                exported_at=bundle.get("exported_at"))
-                            prov = None
-                            if prov_day > asof_day:
-                                pr = remaining_budget(pdf, pace_month, prov_day, target, bl)
-                                pr_fixed = sum(x["value"] for x in pr["booked_rows"])
-                                prov = {"day": prov_day, "ts": prov_ts, "r": pr,
-                                        "fixed": pr_fixed, "var": pr["spent"] - pr_fixed}
-
-                            # 使った額のうち、自分の裁量で動かせるのは変動費だけ。
-                            # 固定費と混ぜて出すと「何にそんなに使ったのか」が分からなくなる
-                            fixed_paid = sum(x["value"] for x in r["booked_rows"])
-                            var_paid = r["spent"] - fixed_paid
-                            paid_note = f"固定費 {fyen(fixed_paid)} ／ 変動費 {fyen(var_paid)}"
-
-                            # 上段2つ: 日々の判断に使う数字。同じ大きさで並べる
-                            # 過去の月も見られるので、ラベルに「今月」とは書かない
-                            if over:
-                                main = (
-                                    cell("目標からの超過額", fyen(-r["remain"]),
-                                         f"上限 {fyen(r['cap'])} に対して {fyen(r['spent'] + r['upcoming'])}",
-                                         ERROR)
-                                    + cell("使った額", fyen(r["spent"]), paid_note, INK))
-                            elif r["per_day"]:
-                                main = (
-                                    cell("1日あたり使えるのは", fyen(r["per_day"]), span, GREEN_900)
-                                    + cell("あと使えるのは", fyen(r["remain"]),
-                                           f"上限 {fyen(r['cap'])} − 使った額 {fyen(r['spent'])}"
-                                           f" − 今後の固定費 {fyen(r['upcoming'])}", GREEN_900))
-                            else:
-                                main = (
-                                    cell("最終的な余り", fyen(r["remain"]), "今月は終了", GREEN_900)
-                                    + cell("使った額", fyen(r["spent"]), paid_note, INK))
-
-                            # 下段2つ: ペースの良し悪しを示す指標
-                            if v_med > 0:
-                                diff = v_now / v_med - 1
-                                pace_val = f"{diff * 100:+.0f}%"
-                                pace_sub = (f"{asof_day}日時点 {fyen(v_now)} ／ "
-                                            f"過去{len(hist_months)}ヶ月の中央値 {fyen(v_med)}")
-                                pace_col = ERROR if diff > 0.05 else (GREEN_900 if diff < -0.05 else INK)
-                            else:
-                                pace_val, pace_sub, pace_col = "—", "比較できる過去データがありません", SUBTLE
-
-                            if rate_est is None:
-                                rate_val, rate_sub, rate_col = "—", "月初は不安定なため非表示", SUBTLE
-                            else:
-                                gap = rate_est - target * 100
-                                rate_val = f"{rate_est:.1f}%"
-                                rate_sub = (f"目標 {target*100:.0f}% に対して {gap:+.1f}pt"
-                                            f" ／ 着地見込み {fyen(land)}")
-                                rate_col = GREEN_900 if gap >= 0 else ERROR
-
-                            side = (
-                                cell(f"変動費のペース（過去{len(hist_months)}ヶ月の同じ日と比べて）",
-                                     pace_val, pace_sub, pace_col, "ph-mid")
-                                + cell("このペースでの貯蓄率", rate_val, rate_sub, rate_col, "ph-mid"))
-
-                            # 速報の1日あたり。暗算させないために画面で出す
-                            prov_cells = ""
-                            if prov and prov["r"]["per_day"]:
-                                pv = prov["r"]["per_day"]
-                                gap2 = pv - (r["per_day"] or 0)
-                                # 月末を跨ぐので日付は Timestamp で足す（day+1 だと31日で壊れる）
-                                p_from = prov["ts"] + pd.Timedelta(days=1)
-                                prov_cells = (
-                                    cell(f'1日あたり（速報 {prov["ts"].month}/{prov["ts"].day}時点）'
-                                         '<span class="ph-tag">未確定</span>',
-                                         fyen(pv),
-                                         f'{p_from.month}/{p_from.day}〜'
-                                         f'{int(pace_month[5:7])}/{dim} の{prov["r"]["left_days"]}日分'
-                                         f'　／　確定ベースとの差 '
-                                         f'{"+" if gap2 >= 0 else "−"}{fyen(abs(gap2))}',
-                                         SUBTLE, "ph-prov", "ph prov")
-                                    + cell('速報で増えたぶん<span class="ph-tag">未確定</span>',
-                                           fyen(prov["r"]["spent"] - r["spent"]),
-                                           f'変動費 {fyen(prov["var"] - var_paid)}'
-                                           f' ／ 固定費 {fyen(prov["fixed"] - fixed_paid)}'
-                                           f'　／　この{prov["day"] - asof_day}日分はまだ増えます',
-                                           SUBTLE, "ph-prov", "ph prov"))
-
-                            st.markdown(
-                                f'<div class="pace-hero">{main}{side}{prov_cells}</div>',
-                                unsafe_allow_html=True)
                             # 基準日は最新明細より手前に出るので、データが古いと誤解されやすい。
                             # 「どこまで取り込めているか」を並べて書いて、遅延ぶんだと分かるようにする
                             imported = last_real_date(pdf)
@@ -1678,263 +1924,523 @@ if role:
                                 f"カード計上の遅れ{CARD_LAG_DAYS}日分を引いた日を基準にしています"
                                 if imported is not None else
                                 f"カード計上の遅れ{CARD_LAG_DAYS}日分を手前に置いています")
-                            st.caption(
-                                f"{month_label(pace_month)}／{asof_ts.month}月{asof_ts.day}日時点のデータ"
-                                f"（{asof_day} / {dim}日経過）　:grey[ⓘ {imported_note}]",
-                                help=f"{imported_note}。データが古いのではなく、"
-                                     "カード利用分がMoneyForwardに載るまでの遅れを見込んで"
-                                     "基準日を手前に置いています。")
 
-                            # 速報が確定より大きく出る月がある。理由を読めるようにしておく
-                            if prov and prov["r"]["per_day"] and r["per_day"] \
-                                    and prov["r"]["per_day"] > r["per_day"]:
-                                with st.expander("▼ 速報のほうが1日あたりが大きいのはなぜか"):
+                            def freshness_caption():
+                                """基準日と取込の鮮度。as-of が今日から離れる原因のうち、
+                                その場で直せるのは「取り込んでいない日数」だけなので必ず出す。"""
+                                st.caption(
+                                    f"{month_label(pace_month)}／{cur_ts.month}月{cur_ts.day}日時点"
+                                    f"（{cur_day} / {dim}日経過）"
+                                    + ("・速報（未確定）" if use_prov else "")
+                                    + f"　:grey[ⓘ {imported_note}]",
+                                    help=f"{imported_note}。データが古いのではなく、"
+                                         "カード利用分がMoneyForwardに載るまでの遅れを見込んで"
+                                         "基準日を手前に置いています。")
+                                # 取込の鮮度はローカルと出どころが違う。クラウドが持っているのは
+                                # 「バンドルをいつ書き出したか」だけなので、それを出す
+                                st.caption(
+                                    f"データ更新: {bundle.get('exported_at', '不明')}"
+                                    "（ローカルで update_cloud_data.bat を実行した時刻）")
+
+                            # ============================================================
+                            # 第1階層 ホーム — 収入・支出・収支だけ。それ以外は下の階層へ
+                            # ============================================================
+                            def render_home():
+                                # 見通し。実績（上）とは性格が違うので同じ表に並べない。
+                                # ⚠️ 収支はサイドバーのトグルに従う集計、今後落ちる固定費は
+                                # ペース計算の集計（経常ベース固定・按分後・年次費用の月割り込み）。
+                                # 土台が違うので、引き算の結果は目安として読む
+                                fc_bal = kpi["balance"] - r["upcoming"]
+                                fc_day = (f'{fyen(r["per_day"])}<span style="font-size:13px"> / 日</span>'
+                                          if r["per_day"] else ("¥0" if over else "—"))
+                                fc = (
+                                    f'<div class="hc-fc"><div class="hc-h">見通し</div><table>'
+                                    f'<tr><td class="k">今後の固定費 {fyen(r["upcoming"])} を'
+                                    f'引いた収支</td>'
+                                    f'<td class="v" style="color:'
+                                    f'{GREEN_900 if fc_bal >= 0 else ERROR}">{fyen(fc_bal)}</td></tr>'
+                                    f'<tr><td class="k">予算に対して1日あたり使えるのは</td>'
+                                    f'<td class="v" style="color:'
+                                    f'{GREEN_900 if r["per_day"] else SUBTLE}">{fc_day}</td></tr>'
+                                    f'</table>'
+                                    f'<div class="hc-note">上は実績、ここから下は<b>目安</b>です。'
+                                    f'1日あたりは残り{r["left_days"]}日で割った額（詳しくは「予算」へ）。'
+                                    f'　※ 収支はサイドバーの設定に従う集計、今後の固定費は'
+                                    f'ペース計算の集計（按分後・年次費用の月割り込み）で土台が'
+                                    f'違うため、引き算の結果は概算です。</div></div>')
+                                st.markdown(
+                                    f'<div class="homecard">'
+                                    f'<div class="hc-ttl">家計簿<span>{period_label}</span></div>'
+                                    f'<table>'
+                                    f'<tr><td class="k">収入</td>'
+                                    f'<td class="v" style="color:{GREEN_900}">{fyen(kpi["income"])}</td></tr>'
+                                    f'<tr><td class="k">支出</td>'
+                                    f'<td class="v" style="color:{SHU}">−{fyen(kpi["expense"])}</td></tr>'
+                                    f'<tr><td class="k">収支</td>'
+                                    f'<td class="v">{fyen(kpi["balance"])}</td></tr>'
+                                    f'</table>{fc}</div>',
+                                    unsafe_allow_html=True)
+                                if excluded_note:
+                                    st.caption(excluded_note)
+
+                                # 予算カード。カード全体がタップ領域（MFのホームと同じ入口）
+                                if r["left_days"] > 0:
+                                    head = f"**予算**　　あと {r['left_days']} 日"
+                                else:
+                                    head = "**予算**　　この月は終了"
+                                # バーの3分割（支出／今後の固定費／残り）と語をそろえる
+                                body = (f"支出 {fyen(r['spent'])}　＋今後 {fyen(r['upcoming'])}　　"
+                                        + (f"残り **{fyen(r['remain'])}**" if not over
+                                           else f":red[**{fyen(-r['remain'])} 超過**]"))
+                                if landing_over is not None and landing_over > 0:
+                                    tail = f"\n\n⛅ :red[このままだと予算を {fyen(landing_over)} 超えそう]"
+                                elif landing_over is not None:
+                                    tail = f"\n\n☀️ このままなら {fyen(-landing_over)} 余りそう"
+                                else:
+                                    tail = "\n\n着地の見込みは月初のうちは出しません"
+                                # バーの空白＝残り になるよう、今後落ちる固定費まで塗る
+                                upc_pct = ((r["spent"] + r["upcoming"]) / r["cap"] * 100
+                                           if r["cap"] > 0 else None)
+                                if nav_row("budget", f"{head}\n\n{body}{tail}",
+                                           cap_pct, upc_pct, over=over):
+                                    nav_go(NAV_BUDGET)
+                                freshness_caption()
+
+                            # ============================================================
+                            # 第2階層 予算 — 変動費と固定費の「予算・支出・残り」だけ
+                            # ============================================================
+                            def render_budget():
+                                nav_header(NAV_BUDGET)
+                                st.caption(f"{period_label}（{pace_month[:4]}年"
+                                           f"{int(pace_month[5:7])}月1日〜{int(pace_month[5:7])}月{dim}日）")
+
+                                # ⚠️ 生HTMLなので Markdown の ** は効かない。<b> を使う
+                                if landing_over is not None and landing_over > 0:
+                                    st.markdown(
+                                        f'<div class="forecast warn">'
+                                        f'<div class="fc-icon">⛅</div><div>'
+                                        f'<div class="fc-label">結果予想</div>'
+                                        f'<div class="fc-msg">予算を '
+                                        f'<b style="color:{ERROR}">{fyen(landing_over)}</b> '
+                                        f'超えちゃいそう。</div>'
+                                        f'<div class="fc-note">着地の見込み {fyen(land)} '
+                                        f'／ 上限 {fyen(r["cap"])}。最後まであきらめないで。</div>'
+                                        f'</div></div>', unsafe_allow_html=True)
+                                elif landing_over is not None:
+                                    st.markdown(
+                                        f'<div class="forecast">'
+                                        f'<div class="fc-icon">☀️</div><div>'
+                                        f'<div class="fc-label">結果予想</div>'
+                                        f'<div class="fc-msg">このままなら '
+                                        f'<b style="color:{GREEN_900}">{fyen(-landing_over)}</b> '
+                                        f'余りそう。</div>'
+                                        f'<div class="fc-note">着地の見込み {fyen(land)} '
+                                        f'／ 上限 {fyen(r["cap"])}</div>'
+                                        f'</div></div>', unsafe_allow_html=True)
+
+                                days_txt = (f'あと<b>{r["left_days"]}</b>日'
+                                            if r["left_days"] > 0 else "この月は終了")
+                                # バーは 支払い済み → 今後落ちる固定費 → 残り の3分割。
+                                # 空白部分が「残り」と一致する
+                                upc_pct = ((r["spent"] + r["upcoming"]) / r["cap"] * 100
+                                           if r["cap"] > 0 else None)
+                                st.markdown(
+                                    f'<div class="totbar"><div class="tb-days">{days_txt}</div>'
+                                    f'<div class="tb-line"><span>支出 {fyen(r["spent"])}'
+                                    f'　＋今後の固定費 {fyen(r["upcoming"])}</span>'
+                                    f'<span>予算 {fyen(r["cap"])}</span></div>'
+                                    f'<div class="tb-line"><span></span><span>残り'
+                                    f'<b style="color:{ERROR if over else INK}">'
+                                    f'{fyen(r["remain"]) if not over else "−" + fyen(-r["remain"])[1:]}'
+                                    f'</b></span></div>'
+                                    f'<div class="tb-bar" style="background:'
+                                    f'{bar_gradient(cap_pct, upc_pct, over)}"></div></div>',
+                                    unsafe_allow_html=True)
+
+                                # ---- MFに無い独自の2つ。第1階層を汚さずにここへ置く ----
+                                if r["per_day"]:
+                                    pd_val, pd_sub, pd_col = fyen(r["per_day"]), span, GREEN_900
+                                elif over:
+                                    pd_val, pd_sub, pd_col = "¥0", "予算を超えています", ERROR
+                                else:
+                                    pd_val, pd_sub, pd_col = "—", "この月は終了", SUBTLE
+                                if rate_est is None:
+                                    rate_val, rate_sub, rate_col = "—", "月初は不安定なため非表示", SUBTLE
+                                else:
+                                    gap = rate_est - target * 100
+                                    rate_val = f"{rate_est:.1f}%"
+                                    rate_sub = (f"目標 {target*100:.0f}% に対して {gap:+.1f}pt"
+                                                f" ／ 着地見込み {fyen(land)}")
+                                    rate_col = GREEN_900 if gap >= 0 else ERROR
+                                st.markdown(
+                                    '<div class="pace-hero">'
+                                    + cell("1日あたり使えるのは", pd_val, pd_sub, pd_col)
+                                    + cell("このペースでの貯蓄率", rate_val, rate_sub, rate_col)
+                                    + '</div>', unsafe_allow_html=True)
+
+                                # ---- 基準日の切り替え（第2〜4階層すべてに効く） ----
+                                if has_prov_day:
+                                    st.segmented_control(
+                                        "基準日", ["確定", "速報"], key="w_asof_mode",
+                                        default="確定", width="content",
+                                        help=f"確定は{asof_ts.month}/{asof_ts.day}まで"
+                                             f"（カード計上の遅れ{CARD_LAG_DAYS}日分を引いた日）、"
+                                             f"速報は{prov_ts.month}/{prov_ts.day}まで（未確定・まだ増えます）。"
+                                             "選んだ基準日は変動費・固定費の内訳にも効きます。")
+                                    if use_prov:
+                                        st.caption(
+                                            f":orange[速報表示中]　{prov_ts.month}/{prov_ts.day}まで。"
+                                            f"確定より {fyen(r_prov['spent'] - r_fix['spent'])} 多く"
+                                            "計上されていますが、この日数分はまだ増えます。")
+                                freshness_caption()
+
+                                st.markdown("##### 内訳")
+                                v_label = (f"**変動費**　　予算 {fyen(var_budget)}\n\n"
+                                           f"支出 {fyen(var_paid)}　　")
+                                v_left = var_budget - var_paid
+                                v_label += (f"残り **{fyen(v_left)}**" if v_left >= 0
+                                            else f":red[**{fyen(-v_left)} 超過**]")
+                                if nav_row("var", v_label, var_pct, over=v_left < 0):
+                                    nav_go(NAV_VAR)
+
+                                f_label = (f"**固定費**　　今月の着地 {fyen(fx_land)}\n\n"
+                                           f"支払い済み {fyen(fixed_paid)}　　"
+                                           f"これから **{fyen(r['upcoming'])}**")
+                                # 固定費は「着地」が分母。濃い＝支払い済み、薄い＝これから
+                                if nav_row("fixed", f_label, fix_pct, 100.0):
+                                    nav_go(NAV_FIXED)
+
+                                if r["irregular_income"] > 0:
+                                    st.caption(f"※ 今月は賞与など不定期の入金 "
+                                               f"{fyen(r['irregular_income'])} があります"
+                                               "（上限には含めていません）")
+                                if bl_start and len(hist_months) < BASELINE_WINDOW:
+                                    st.warning(
+                                        f"生活水準が変わった {month_label(bl_start)} を起点にしているため、"
+                                        f"基準線は **{len(hist_months)}ヶ月ぶん**"
+                                        f"（{'・'.join(month_label(m) for m in hist_months)}）"
+                                        f"のデータで作っています。{BASELINE_WINDOW}ヶ月そろうまでは"
+                                        "見込みがぶれやすく、特に隔月・不定期の費目は精度が落ちます。",
+                                        icon="⚠️")
+
+                                render_budget_notes()
+
+                            def render_budget_notes():
+                                """第2階層の根拠。数字の出どころをたどれるようにしておく。"""
+                                with st.expander("▼ 残り使える額の計算過程"):
+                                    html_table(pd.DataFrame([
+                                        {"項目": "今月の収入見込み", "金額": fyen(r["income_est"])},
+                                        {"項目": f"× {(1-target)*100:.0f}%（目標貯蓄率 {target*100:.0f}%）",
+                                         "金額": ""},
+                                        {"項目": "= 使ってよい上限", "金額": fyen(r["cap"])},
+                                        {"項目": "− すでに使った額", "金額": fyen(r["spent"])},
+                                        {"項目": "　　うち 固定費（支払い済み）", "金額": fyen(fixed_paid)},
+                                        {"項目": "　　うち 変動費", "金額": fyen(var_paid)},
+                                        {"項目": "− 今後落ちる固定費", "金額": fyen(r["upcoming"])},
+                                        {"項目": "= 残り使える額", "金額": fyen(r["remain"])},
+                                    ]))
+                                    lv_rows = pdf[pdf["id"].astype(str).str.startswith("__leveled__")]
+                                    lv_cur = lv_rows[lv_rows["month"] == pace_month]
+                                    if not lv_cur.empty:
+                                        names = sorted(lv_cur["sub"].unique())
+                                        st.caption(
+                                            "※ 年次・複数年の費用（" + "・".join(names) + "）は月割りの"
+                                            f"積立として毎月 {fyen(-lv_cur['amount'].sum())} 計上しています"
+                                            "（契約マスタに周期があるものは契約額から、"
+                                            "それ以外は `leveled_subs` の設定から）")
+                                    sh = settle_shares()
+                                    st.caption(
+                                        f"※ {display_names()[1]}と分け合う費用は、清算タブと同じ按分で"
+                                        f"自分の負担分だけを計上しています"
+                                        f"（住宅費 {sh['rent_share']*100:.0f}%／"
+                                        f"{'・'.join(sh['split_subs'])} {sh['split_share']*100:.0f}%）。"
+                                        "相手からの清算入金は収入に含めていません")
+                                    if sh["wife_loan_default"]:
+                                        st.caption(
+                                            f"※ 相手が自分の口座から直接払っているローン "
+                                            f"{fyen(sh['wife_loan_default'])} も住宅費の総額に含めています"
+                                            "（MFには載らないため清算タブの入力値を使用）")
+
+                                if (r_prov and r_prov["per_day"] and r_fix["per_day"]
+                                        and r_prov["per_day"] > r_fix["per_day"]):
+                                    with st.expander("▼ 速報のほうが1日あたりが大きいのはなぜか"):
+                                        st.markdown(
+                                            f"""
+                                            **as-of を進めても、1日あたりが下がるとは限りません。**
+                                            分子（残り使える額）と分母（残り日数）が同時に動くためです。
+
+                                            | | 確定 {asof_ts.month}/{asof_ts.day} | 速報 {prov_ts.month}/{prov_ts.day} |
+                                            |---|---:|---:|
+                                            | 残り使える額 | {fyen(r_fix['remain'])} | {fyen(r_prov['remain'])} |
+                                            | 残り日数 | {r_fix['left_days']}日 | {r_prov['left_days']}日 |
+                                            | 1日あたり | {fyen(r_fix['per_day'])} | {fyen(r_prov['per_day'])} |
+
+                                            この{prov_day - asof_day}日で**残り使える額は
+                                            {fyen(abs(r_fix['remain'] - r_prov['remain']))} しか
+                                            減っていない**のに、残り日数は{prov_day - asof_day}日
+                                            減りました。だから割った結果が大きくなります。
+
+                                            **速報はまだ増えます。**実測（2026-08-15）では、最終取引日の
+                                            1日前で約8%、2日前で約1.5%の支出が後から足されました。
+                                            いまの速報値は**低めに出ていると考えてください**。
+                                            """
+                                        )
+
+                                with st.expander("▼ この計算の前提"):
                                     st.markdown(
                                         f"""
-                                        **as-of を進めても、1日あたりが下がるとは限りません。**
-                                        分子（残り使える額）と分母（残り日数）が同時に動くためです。
-
-                                        | | 確定 {asof_ts.month}/{asof_ts.day} | 速報 {prov['ts'].month}/{prov['ts'].day} |
-                                        |---|---:|---:|
-                                        | 残り使える額 | {fyen(r['remain'])} | {fyen(prov['r']['remain'])} |
-                                        | 残り日数 | {r['left_days']}日 | {prov['r']['left_days']}日 |
-                                        | 1日あたり | {fyen(r['per_day'])} | {fyen(prov['r']['per_day'])} |
-
-                                        この{prov['day'] - asof_day}日で**残り使える額は
-                                        {fyen(abs(r['remain'] - prov['r']['remain']))} しか減っていない**のに、
-                                        残り日数は{prov['day'] - asof_day}日減りました。だから割った結果が
-                                        大きくなります。
-
-                                        使った額は {fyen(prov['r']['spent'] - r['spent'])} 増えていますが、
-                                        その大半は固定費（{fyen(prov['fixed'] - fixed_paid)}）で、
-                                        **「今後落ちる固定費」から「使った額」へ移っただけ**なので
-                                        残り使える額はほとんど動いていません。
-
-                                        **速報はまだ増えます。**実測（2026-08-15）では、最終取引日の
-                                        1日前で約8%、2日前で約1.5%の支出が後から足されました。
-                                        いまの速報値は**低めに出ていると考えてください**。
+                                        - **as-of 日**: データの最終日から **{CARD_LAG_DAYS}日** 手前。
+                                          カードの計上が遅れるぶん、直近数日は必ず過少に出るため
+                                          （実測: Amex 3日 / モバイルPASMO・Amazon 4日 / 楽天カード 7日）。
+                                          分子（実績）も分母（経過日数）もこの日でそろえています
+                                        - **上限**: 経常収入の見込み × {(1-target)*100:.0f}%。
+                                          賞与など出現{FREQ_LO*100:.0f}%未満の不定期収入は含めません
+                                        - **収入・固定費の見込み**: 基準線（{'・'.join(month_label(m) for m in hist_months)}）
+                                          での中項目ごとの出現頻度で分岐
+                                          （{FREQ_HI*100:.0f}%以上は出現月の中央値、{FREQ_LO*100:.0f}〜{FREQ_HI*100:.0f}%は0の月込みの平均、
+                                          {FREQ_LO*100:.0f}%未満は補完しない）
+                                        - **基準線の起点**: {month_label(bl_start) + ' 以降' if bl_start else '指定なし（直前' + str(BASELINE_WINDOW) + 'ヶ月）'}。
+                                          住み替えなどで生活水準が変わると、前の家の家賃・管理費が混ざって
+                                          固定費の見込みが過小になるため。`data/settings.json` の `baseline_from` で変更できます
+                                        - **{display_names()[1]}と分け合う費用**: 清算タブと同じルールで按分し、
+                                          自分の負担分だけを計上しています。相手からの清算入金は収入に含めません
+                                        - **サイドバーのトグルは効きません**。ペース計算は
+                                          経常ベース・割り勘相殺OFF で固定です
+                                        - 目標貯蓄率は `data/settings.json` の `savings_target` で変更できます
                                         """
                                     )
 
-                            # データの鮮度。クラウドは閲覧専用なので、ローカル版の
-                            # 「取込時刻」ではなくバンドルの書き出し時刻を使う。
-                            # 閲覧者にとってはこちらが正しい（取り込んでも書き出さなければ届かない）
-                            exp_ts = pd.to_datetime(bundle.get("exported_at"), errors="coerce")
-                            if pd.notna(exp_ts):
-                                ago = (pd.Timestamp(datetime.now(JST).date())
-                                       - exp_ts.normalize()).days
-                                txt = (f"最後のデータ更新 {exp_ts.month}月{exp_ts.day}日 "
-                                       f"{exp_ts.strftime('%H:%M')}"
-                                       + (f"（{ago}日前）" if ago > 0 else "（今日）"))
-                                if ago >= 1:
-                                    st.info(
-                                        txt + "。ローカルPCで `update_cloud_data.bat` を実行すると、"
-                                        f"基準日が最大{ago}日ぶん新しくなります。", icon="📥")
+                            # ============================================================
+                            # 第3階層 固定費 — 今後落ちるぶんと計上済みぶん
+                            # 契約の管理（サブスクの契約マスタ）は「固定費」タブのまま
+                            # ============================================================
+                            def render_fixed():
+                                nav_header(NAV_FIXED)
+                                st.markdown(
+                                    f'<div class="totbar">'
+                                    f'<div class="tb-line"><span>支払い済み {fyen(fixed_paid)}</span>'
+                                    f'<span>今月の着地 {fyen(fx_land)}</span></div>'
+                                    f'<div class="tb-line"><span></span>'
+                                    f'<span>これから<b>{fyen(r["upcoming"])}</b></span></div>'
+                                    f'<div class="tb-bar" style="background:'
+                                    f'{bar_gradient(fix_pct, 100.0)}"></div></div>',
+                                    unsafe_allow_html=True)
+                                if abs(fx_gap) >= 1000:
+                                    st.caption(
+                                        f"※ 今月は月額の見込み（{fyen(fx_plan)}）より "
+                                        f"{fyen(abs(fx_gap))} "
+                                        + ("多く出ています" if fx_gap > 0 else "少なくなっています")
+                                        + "。都度の支払い（駐車場の都度分・寄附など）が乗ると差が出ます。")
                                 else:
-                                    st.caption(txt)
-                            if r["irregular_income"] > 0:
-                                st.caption(f"※ 今月は賞与など不定期の入金 {fyen(r['irregular_income'])} が"
-                                           "あります（上限には含めていません）")
-                            if bl_start and len(hist_months) < BASELINE_WINDOW:
-                                st.warning(
-                                    f"生活水準が変わった {month_label(bl_start)} を起点にしているため、"
-                                    f"基準線は **{len(hist_months)}ヶ月ぶん**（{'・'.join(month_label(m) for m in hist_months)}）"
-                                    f"のデータで作っています。{BASELINE_WINDOW}ヶ月そろうまでは見込みがぶれやすく、"
-                                    "特に隔月・不定期の費目は精度が落ちます。", icon="⚠️")
-
-                            # ---- 根拠 ----
-                            with st.expander("▼ 残り使える額の計算過程"):
-                                html_table(pd.DataFrame([
-                                    {"項目": "今月の収入見込み", "金額": fyen(r["income_est"])},
-                                    {"項目": f"× {(1-target)*100:.0f}%（目標貯蓄率 {target*100:.0f}%）",
-                                     "金額": ""},
-                                    {"項目": "= 使ってよい上限", "金額": fyen(r["cap"])},
-                                    {"項目": "− すでに使った額", "金額": fyen(r["spent"])},
-                                    {"項目": "　　うち 固定費（支払い済み）", "金額": fyen(fixed_paid)},
-                                    {"項目": "　　うち 変動費", "金額": fyen(var_paid)},
-                                    {"項目": "− 今後落ちる固定費", "金額": fyen(r["upcoming"])},
-                                    {"項目": "= 残り使える額", "金額": fyen(r["remain"])},
-                                ]))
+                                    st.caption(f"※ 月額の見込みは {fyen(fx_plan)} です。")
 
                                 KIND_LABEL = {"monthly": "毎月", "periodic": "隔月等",
                                               "irregular": "不定期", "fixed": "確定額"}
-                                fc1, fc2 = st.columns(2)
-                                with fc1:
-                                    st.markdown(f"**今後落ちる固定費の内訳**（{fyen(r['upcoming'])}）")
-                                    if r["upcoming_rows"]:
-                                        html_table(pd.DataFrame([
-                                            {"費目": x["sub"], "見込み": fyen(x["value"]),
-                                             "頻度": KIND_LABEL.get(x["kind"], x["kind"])}
-                                            for x in r["upcoming_rows"]]))
-                                    else:
-                                        st.caption("この月の固定費はすべて計上済みです。")
-                                with fc2:
-                                    st.markdown(f"**計上済みの固定費**（{fyen(sum(x['value'] for x in r['booked_rows']))}）")
-                                    if r["booked_rows"]:
-                                        html_table(pd.DataFrame([
-                                            {"費目": x["sub"], "実績": fyen(x["value"])}
-                                            for x in r["booked_rows"]]))
-                                    else:
-                                        st.caption("まだありません。")
+                                st.markdown(f"##### これから落ちる（{fyen(r['upcoming'])}）")
+                                if r["upcoming_rows"]:
+                                    html_table(pd.DataFrame([
+                                        {"費目": x["sub"], "見込み": fyen(x["value"]),
+                                         "頻度": KIND_LABEL.get(x["kind"], x["kind"])}
+                                        for x in r["upcoming_rows"]]))
+                                else:
+                                    st.caption("この月の固定費はすべて計上済みです。")
 
-                                lv = leveled_defs()
-                                if lv:
-                                    st.caption(
-                                        "※ 年次費用（" + "・".join(lv) + "）は月割りの積立として"
-                                        f"毎月 {fyen(sum(d['monthly'] for d in lv.values()))} 計上しています")
-                                sh = settle_shares()
-                                st.caption(
-                                    f"※ {display_names()[1]}と分け合う費用は、清算タブと同じ按分で"
-                                    f"自分の負担分だけを計上しています"
-                                    f"（住宅費 {sh['rent_share']*100:.0f}%／"
-                                    f"{'・'.join(sh['split_subs'])} {sh['split_share']*100:.0f}%）。"
-                                    "相手からの清算入金は収入に含めていません")
-                                if sh["wife_loan_default"]:
-                                    st.caption(
-                                        f"※ 相手が自分の口座から直接払っているローン "
-                                        f"{fyen(sh['wife_loan_default'])} も住宅費の総額に含めています"
-                                        "（MFには載らないため清算タブの入力値を使用）")
+                                st.markdown(f"##### 支払い済み（{fyen(fixed_paid)}）")
+                                if r["booked_rows"]:
+                                    html_table(pd.DataFrame([
+                                        {"費目": x["sub"], "実績": fyen(x["value"])}
+                                        for x in r["booked_rows"]]))
+                                else:
+                                    st.caption("まだありません。")
 
-                            # ---- 変動費の累積グラフ ----
-                            st.subheader("変動費の使い方")
-                            st.caption("固定費は日々コントロールできないので、変動費だけで描いています。"
-                                       f"薄い線は過去{len(hist_months)}ヶ月、破線はその中央値。"
-                                       + ("点線は速報（未確定・まだ増えます）。" if prov else ""))
-                            fig = go.Figure()
-                            for m, cum in zip(hist_months, series):
-                                fig.add_trace(go.Scatter(
-                                    x=list(range(1, len(cum) + 1)), y=cum, mode="lines",
-                                    name=month_label(m), line=dict(color=GRAY_200, width=1),
-                                    hovertemplate="%{y:,.0f}円<extra>" + month_label(m) + "</extra>"))
-                            fig.add_trace(go.Scatter(
-                                x=list(range(1, 32)), y=med, mode="lines",
-                                name=f"過去{len(hist_months)}ヶ月の中央値",
-                                line=dict(color=GRAY_600, width=1.5, dash="dash"),
-                                hovertemplate="%{y:,.0f}円<extra>中央値</extra>"))
-                            fig.add_trace(go.Scatter(
-                                x=list(range(1, dim + 1)), y=cur_cum, mode="lines",
-                                name=month_label(pace_month),
-                                line=dict(color=GREEN_600, width=3),
-                                hovertemplate="%{y:,.0f}円<extra>" + month_label(pace_month) + "</extra>"))
-                            if prov:
-                                # 確定〜最終取引日は点線。まだ増えるぶんだと目で分かるようにする
-                                p_cum = variable_cumsum(pdf, pace_month, upto=prov["day"])
-                                seg = [v if asof_day <= i + 1 <= prov["day"] else None
-                                       for i, v in enumerate(p_cum)]
-                                fig.add_trace(go.Scatter(
-                                    x=list(range(1, dim + 1)), y=seg, mode="lines",
-                                    name="速報（未確定）",
-                                    line=dict(color=GREEN_600, width=3, dash="dot"),
-                                    hovertemplate="%{y:,.0f}円<extra>速報（未確定）</extra>"))
-                            fig.add_vline(x=asof_day, line=dict(color=SUBTLE, width=1, dash="dot"))
-                            fig.update_xaxes(title_text="日", dtick=5, range=[1, 31])
-                            st.plotly_chart(base_layout(fig, height=300), width="stretch",
-                                            key="pace_var_cum", config=PLOTLY_CONFIG)
+                                st.caption("契約の登録・解約の管理は「固定費」タブで行えます"
+                                           "（サブスクの契約マスタ）。")
 
-                            # 何にいくら使っているか。ペース管理の主目的なので折りたたまない。
-                            # 中項目は40件あって判断に使えないので、MFの大項目にまとめる
-                            total_budget = r["remain"] + var_paid      # 変動費の総枠（月間）
-                            budgets = variable_budgets(total_budget)
-                            crows = [x for x in category_progress(pdf, pace_month, asof_day, budgets)
-                                     if x["budget"] > 0 or x["actual"] > 0]
-                            if crows:
+                            # ============================================================
+                            # 第3階層 変動費 — 大項目の一覧
+                            # ============================================================
+                            def render_var():
+                                nav_header(NAV_VAR)
+                                if not crows:
+                                    st.caption("この期間の変動費はまだありません。")
+                                    return
+
+                                st.markdown(
+                                    f'<div class="totbar">'
+                                    f'<div class="tb-line"><span>支出 {fyen(var_paid)}</span>'
+                                    f'<span>予算 {fyen(var_budget)}</span></div>'
+                                    f'<div class="tb-line"><span></span><span>残り'
+                                    f'<b>{fyen(var_budget - var_paid)}</b></span></div>'
+                                    f'<div class="tb-bar{" over" if var_paid > var_budget else ""}">'
+                                    f'<i style="width:{min(100, var_pct or 0):.0f}%"></i></div></div>',
+                                    unsafe_allow_html=True)
+
                                 ongoing = r["left_days"] > 0
-                                st.markdown(f"**変動費の内訳**（{asof_day}日時点・{fyen(var_paid)}）")
                                 st.caption(
                                     f"予算は「使ってよい上限 − 固定費の着地」= {fyen(total_budget)} を"
                                     "大項目へ割合で配ったもの。"
                                     + (f"1日あたりは残り{r['left_days']}日で割った額です。" if ongoing
                                        else "この月はもう終わっているので1日あたりは出しません。"))
 
-                                def crow(x, total=False):
+                                # ⚠️ 行のキーはASCIIにする。キーはDOMのクラス名になり CSS の
+                                # セレクタで使うので、大項目名（日本語・「・」を含む）を
+                                # そのまま入れるとセレクタが当たらないことがある
+                                for i, x in enumerate(crows):
                                     b, a, left = x["budget"], x["actual"], x["left"]
+                                    head = ("🔥 " if x["over"] else "") + f"**{x['cat']}**"
                                     if x["no_budget"]:
-                                        val, col = fyen(a), SUBTLE
-                                        sub = f'予算なし ／ 支出 {fyen(a)}'
+                                        head += "　　:grey[予算未設定]"
+                                        body = f"支出 {fyen(a)}"
                                     else:
-                                        val, col = ((f'残り {fyen(left)}', INK) if left >= 0
-                                                    else (f'{fyen(-left)} 超過', ERROR))
-                                        sub = (f'予算 {fyen(b)} ／ 支出 {fyen(a)}'
-                                               + (f' ／ 1日あたり {fyen(x["per_day"])}' if ongoing else "")
-                                               + (f' ／ 進捗 {x["pct"]:.0f}%'
-                                                  if x["pct"] is not None else ""))
-                                    bar = ""
-                                    if b > 0:
-                                        w = min(100.0, max(0.0, x["pct"] or 0.0))
-                                        bar = (f'<div class="vp-bar{" over" if x["over"] else ""}">'
-                                               f'<i style="width:{w:.0f}%"></i></div>')
-                                    name = ("🔥 " if x["over"] else "") + x["cat"]
-                                    if x["no_budget"]:
-                                        name = '<span class="vp-tag">予算未設定</span>' + name
-                                    if total:
-                                        name = f"<b>{name}</b>"
-                                    return (f'<div class="vp{" total" if total else ""}">'
-                                            f'<div class="vp-head"><span class="vp-name">{name}</span>'
-                                            f'<span class="vp-amt" style="color:{col}">{val}</span>'
-                                            f'</div>{bar}<div class="vp-sub">{sub}</div></div>')
+                                        head += ("　　" + (f"残り **{fyen(left)}**" if left >= 0
+                                                          else f":red[**{fyen(-left)} 超過**]"))
+                                        body = (f"支出 {fyen(a)}　　予算 {fyen(b)}"
+                                                + (f"　　1日 {fyen(x['per_day'])}" if ongoing else "")
+                                                + (f"　　{x['pct']:.0f}%" if x["pct"] is not None else ""))
+                                    if nav_row(f"cat{i}", f"{head}\n\n{body}",
+                                               x["pct"], over=x["over"]):
+                                        nav_go(NAV_CAT, x["cat"])
 
                                 tb = sum(x["budget"] for x in crows)
                                 ta = sum(x["actual"] for x in crows)
-                                tleft = tb - ta
-                                ld = r["left_days"]
-                                tot_row = {
-                                    "cat": "合計", "budget": tb, "actual": ta, "left": tleft,
-                                    "per_day": (tleft / ld) if ld > 0 and tleft > 0 else 0.0,
-                                    "pct": (ta / tb * 100) if tb > 0 else None,
-                                    "over": tb > 0 and tleft < 0, "no_budget": False}
                                 st.markdown(
-                                    '<div class="vprog">'
-                                    + "".join(crow(x) for x in crows)
-                                    + crow(tot_row, total=True) + '</div>',
-                                    unsafe_allow_html=True)
+                                    f'<div class="vprog"><div class="vp total">'
+                                    f'<div class="vp-head"><span class="vp-name"><b>合計</b></span>'
+                                    f'<span class="vp-amt">残り {fyen(tb - ta)}</span></div>'
+                                    f'<div class="vp-sub">支出 {fyen(ta)} ／ 予算 {fyen(tb)}</div>'
+                                    f'</div></div>', unsafe_allow_html=True)
                                 st.caption(
-                                    "※ 並びは予算の大きい順で固定しています。超過は 🔥 と赤で拾って"
-                                    "ください。「予算未設定」は割合を振っていない大項目で、支出だけを"
-                                    "出しています。")
+                                    "※ 並びは予算の大きい順で固定しています（月の途中で行が入れ替わると"
+                                    "位置で覚えられなくなるため）。「予算未設定」は割合を振っていない"
+                                    "大項目で、支出だけを出しています。")
 
-                                for x in crows:
-                                    det = category_detail(pdf, x["cat"], pace_month, asof_day, [pace_month])
-                                    if not det["subs"]:
-                                        continue
-                                    with st.expander(f'▼ {x["cat"]} の内訳（{fyen(x["actual"])}）'):
-                                        sub_tot = sum(s["amount"] for s in det["subs"])
-                                        html_table(pd.DataFrame([
-                                            {"中項目": s["sub"], "金額": fyen(s["amount"]),
-                                              "件数": f'{s["count"]}件',
-                                              "シェア": (f'{s["amount"] / sub_tot * 100:.0f}%'
-                                                         if sub_tot > 0 else "—")}
-                                            for s in det["subs"]]))
-                            else:
-                                st.caption("この期間の変動費はまだありません。")
+                                st.markdown("##### 使い方の推移")
+                                st.caption("固定費は日々コントロールできないので、変動費だけで描いています。"
+                                           f"薄い線は過去{len(hist_months)}ヶ月、破線はその中央値。")
+                                fig = go.Figure()
+                                for m, cum in zip(hist_months, series):
+                                    fig.add_trace(go.Scatter(
+                                        x=list(range(1, len(cum) + 1)), y=cum, mode="lines",
+                                        name=month_label(m), line=dict(color=GRAY_200, width=1),
+                                        hovertemplate="%{y:,.0f}円<extra>" + month_label(m) + "</extra>"))
+                                fig.add_trace(go.Scatter(
+                                    x=list(range(1, 32)), y=med, mode="lines",
+                                    name=f"過去{len(hist_months)}ヶ月の中央値",
+                                    line=dict(color=GRAY_600, width=1.5, dash="dash"),
+                                    hovertemplate="%{y:,.0f}円<extra>中央値</extra>"))
+                                fig.add_trace(go.Scatter(
+                                    x=list(range(1, dim + 1)), y=cur_cum, mode="lines",
+                                    name=month_label(pace_month),
+                                    line=dict(color=GREEN_600, width=3),
+                                    hovertemplate="%{y:,.0f}円<extra>"
+                                                  + month_label(pace_month) + "</extra>"))
+                                fig.add_vline(x=cur_day, line=dict(color=SUBTLE, width=1, dash="dot"))
+                                fig.update_xaxes(title_text="日", dtick=5, range=[1, 31])
+                                st.plotly_chart(base_layout(fig, height=300), width="stretch",
+                                                key="pace_var_cum",
+                                                                config=PLOTLY_CONFIG)
 
-                            with st.expander("▼ この計算の前提"):
+                                st.caption(
+                                    "※ 予算の配分（大項目ごとの割合）はローカル版で設定します。"
+                                    "ここでは設定された割合で配った結果を表示しています。")
+
+                            # ============================================================
+                            # 第4階層 大項目の詳細
+                            # ============================================================
+                            def render_cat(cat: str):
+                                row = next((x for x in crows if x["cat"] == cat), None)
+                                if row is None:
+                                    nav_go(NAV_VAR)
+                                    return
+                                nav_header(NAV_CAT, cat, title=cat)
+
+                                b, a = row["budget"], row["actual"]
+                                sub = f"（予算 {fyen(b)}" if b > 0 else "（予算未設定"
+                                if b > 0:
+                                    sub += ("　残り " + fyen(row["left"]) if row["left"] >= 0
+                                            else "　" + fyen(-row["left"]) + " 超過")
                                 st.markdown(
-                                    f"""
-                                    - **as-of 日**: データの最終日から **{CARD_LAG_DAYS}日** 手前。
-                                      カードの計上が遅れるぶん直近数日は歯抜けになるため。
-                                      分子（実績）も分母（経過日数）もこの日でそろえています。
-                                      値は実測で決めています（2日前で98.6%が出そろい、
-                                      3日目・4日目に増える精度はゼロでした）
-                                    - **速報**: 最終取引日までを未確定として併記しています。
-                                      **as-of を進めても1日あたりが下がるとは限りません**
-                                      （分子と分母が同時に動くため）。速報はまだ増えるので
-                                      低めに出ていると考えてください
-                                    - **上限**: 経常収入の見込み × {(1-target)*100:.0f}%。
-                                      賞与など出現{FREQ_LO*100:.0f}%未満の不定期収入は含めません
-                                    - **収入・固定費の見込み**: 基準線（{'・'.join(month_label(m) for m in hist_months)}）
-                                      での中項目ごとの出現頻度で分岐
-                                      （{FREQ_HI*100:.0f}%以上は出現月の中央値、{FREQ_LO*100:.0f}〜{FREQ_HI*100:.0f}%は0の月込みの平均、
-                                      {FREQ_LO*100:.0f}%未満は補完しない）
-                                    - **基準線の起点**: {month_label(bl_start) + ' 以降' if bl_start else '指定なし（直前' + str(BASELINE_WINDOW) + 'ヶ月）'}。
-                                      住み替えなどで生活水準が変わると、前の家の家賃・管理費が混ざって
-                                      固定費の見込みが過小になるため。ローカル版の `data/settings.json` で変更します
-                                    - **相手と分け合う費用**: 清算タブと同じルールで按分し、
-                                      自分の負担分だけを計上しています。相手からの清算入金は収入に含めません
-                                    - **サイドバーのトグルは効きません**。ペース計算は
-                                      経常ベース・割り勘相殺OFF で固定です
-                                    - 目標貯蓄率は ローカル版の `data/settings.json` で変更します（クラウドは閲覧専用）
-                                    """
-                                )
+                                    f'<div class="totbar">'
+                                    f'<div class="tb-line"><span>{month_label(pace_month)}合計'
+                                    f'（{cur_day}日時点）</span>'
+                                    f'<span><b style="color:{ERROR if row["over"] else INK}">'
+                                    f'{fyen(a)}</b></span></div>'
+                                    f'<div class="tb-line"><span>{sub}）</span><span></span></div>'
+                                    f'<div class="tb-bar{" over" if row["over"] else ""}">'
+                                    f'<i style="width:{min(100, row["pct"] or 0):.0f}%"></i></div></div>',
+                                    unsafe_allow_html=True)
+
+                                have_m = set(pdf["month"])
+                                ms2 = [m for m in prev_months(pace_month, 12) if m in have_m] \
+                                    + [pace_month]
+                                det = category_detail(pdf, cat, pace_month, cur_day, ms2)
+                                xs = [month_label(m) for m in ms2]
+                                ys = [det["series"][m] for m in ms2]
+
+                                fig2 = go.Figure()
+                                fig2.add_trace(go.Bar(
+                                    x=xs, y=ys, name="実績",
+                                    marker_color=[GREEN_600 if m == pace_month else GRAY_200
+                                                  for m in ms2],
+                                    hovertemplate="%{y:,.0f}円<extra>実績</extra>"))
+                                if b > 0:
+                                    fig2.add_hline(
+                                        y=b, line=dict(color=SUBTLE, width=1, dash="dot"),
+                                        annotation_text=f"予算 {fyen(b)}",
+                                        annotation_position="top left",
+                                        annotation_font=dict(size=11, color=SUBTLE))
+                                base_layout(fig2, height=260, hover="x")
+                                st.plotly_chart(fig2, width="stretch", key="pace_cat_trend",
+                                                config=PLOTLY_CONFIG)
+                                st.caption(
+                                    ("各月とも月末までの実額。" if cur_day >= dim else
+                                     f"過去の月は月末までの実額、{month_label(pace_month)}だけ"
+                                     f"{cur_day}日時点までです（棒が短いのはそのぶん）。"))
+
+                                # ---- 中項目の内訳。各行を開くとその中項目の明細が出る ----
+                                st.markdown(f"##### 中項目の内訳（{cur_day}日時点）")
+                                if not det["subs"]:
+                                    st.caption("この大項目は当月まだ支出がありません。")
+                                    return
+
+                                neg = pdf[(pdf["amount"] < 0) & (pdf["cat"] == cat)
+                                          & (pdf["month"] == pace_month)
+                                          & (pdf["day"] <= cur_day)]
+                                neg = neg[~is_fixed(neg)]
+                                sub_tot = sum(x["amount"] for x in det["subs"])
+                                for x in det["subs"]:
+                                    share = (f"{x['amount'] / sub_tot * 100:.0f}%"
+                                             if sub_tot > 0 else "—")
+                                    with st.expander(f"{x['sub']}　　{fyen(x['amount'])}　"
+                                                     f"（{x['count']}件・{share}）"):
+                                        d = neg[neg["sub"] == x["sub"]].sort_values(
+                                            "date", ascending=False)
+                                        # 合成明細（年次費用の月割り・相手負担の按分）は実在しない行。
+                                        # 合計には入るので隠さず、実在しないと分かるよう印を付ける
+                                        syn = d["id"].astype(str).str.startswith(
+                                            SYNTHETIC_ID_PREFIXES)
+                                        html_table(pd.DataFrame([
+                                            {"日付": pd.Timestamp(t.date).strftime("%m/%d"),
+                                             "内容": (str(t.content)
+                                                      + ("　※実際の明細ではありません" if s else "")),
+                                             "金額": fyen(-t.amount)}
+                                            for t, s in zip(d.itertuples(), syn)]))
+
+                            # ---- ルーティング ----
+                            view, nav_cat = nav_now()
+                            if view == NAV_BUDGET:
+                                render_budget()
+                            elif view == NAV_VAR:
+                                render_var()
+                            elif view == NAV_FIXED:
+                                render_fixed()
+                            elif view == NAV_CAT:
+                                render_cat(nav_cat)
+                            else:
+                                render_home()
+                            # ⚠️ 描画の**後**に呼ぶ。前に置くと Streamlit のスクロール復元に
+                            # 上書きされて効かない（2026-08-23 に実際に効かなかった）
+                            nav_scroll_top()
 
                 # ---- 概要 ----
                 with tab_ov:
