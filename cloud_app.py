@@ -898,14 +898,15 @@ def category_detail(df: pd.DataFrame, cat: str, month: str, asof_day: int,
 # ============================================================
 # クラウドは閲覧専用なので、予算の配分を変えるビュー（ローカル版の
 # NAV_BUDGET_EDIT）は持たない。設定はバンドル越しに来るだけで書き換えられない
-NAV_HOME, NAV_BUDGET, NAV_VAR, NAV_FIXED, NAV_CAT = (
-    "home", "budget", "var", "fixed", "cat")
+NAV_HOME, NAV_BUDGET, NAV_VAR, NAV_FIXED, NAV_CAT, NAV_SPECIAL = (
+    "home", "budget", "var", "fixed", "cat", "special")
 
 # 戻る先。パンくずもこれをたどって作る
+# 特別費用は予算と並ぶホームの子
 NAV_PARENT = {NAV_BUDGET: NAV_HOME, NAV_VAR: NAV_BUDGET, NAV_FIXED: NAV_BUDGET,
-              NAV_CAT: NAV_VAR}
+              NAV_CAT: NAV_VAR, NAV_SPECIAL: NAV_HOME}
 NAV_LABEL = {NAV_HOME: "ホーム", NAV_BUDGET: "予算", NAV_VAR: "変動費",
-             NAV_FIXED: "固定費", NAV_CAT: "大項目"}
+             NAV_FIXED: "固定費", NAV_CAT: "大項目", NAV_SPECIAL: "特別費用"}
 
 
 def nav_now() -> tuple[str, str]:
@@ -1841,7 +1842,9 @@ if role:
                                     & df["cat"].isin(SPECIAL_EXP_CATS), "amount"].sum()
                         i = df.loc[(df["amount"] > 0)
                                    & df["sub"].isin(SPECIAL_INC_SUBS), "amount"].sum()
-                        return float(e), float(i)
+                        ec = int(((df["amount"] < 0) & df["cat"].isin(SPECIAL_EXP_CATS)).sum())
+                        ic = int(((df["amount"] > 0) & df["sub"].isin(SPECIAL_INC_SUBS)).sum())
+                        return float(e), float(i), ec, ic
 
                     if mode == "月":
                         pv = valid[valid["month"] == sel_month]
@@ -1849,14 +1852,24 @@ if role:
                         pv = valid[valid["month"].str.startswith(sel_year)]
                     else:
                         pv = valid
-                    ex_exp, ex_inc = _sp(pv)
-                    cal_year = sel_month[:4] if mode == "月" else None
-                    y_exp = y_inc = None
-                    if cal_year:
-                        y_exp, y_inc = _sp(valid[valid["month"].str.startswith(cal_year)])
-                    if ex_exp > 0 or ex_inc > 0 or (y_exp or 0) > 0 or (y_inc or 0) > 0:
-                        excluded = {"exp": ex_exp, "inc": ex_inc, "year": cal_year,
-                                    "y_exp": y_exp, "y_inc": y_inc}
+                    ex_exp, ex_inc, _, _ = _sp(pv)
+                    win = [m for m in all_months if m in set(valid["month"])][-12:]
+                    rows = []
+                    for m in win:
+                        e, i, ec, ic = _sp(valid[valid["month"] == m])
+                        rows.append({"month": m, "exp": e, "inc": i, "ec": ec, "ic": ic})
+                    n = len(rows) or 1
+                    excluded = {
+                        "exp": ex_exp, "inc": ex_inc, "rows": rows, "n": n,
+                        "exp_total": sum(x["exp"] for x in rows),
+                        "inc_total": sum(x["inc"] for x in rows),
+                        "exp_months": sum(1 for x in rows if x["exp"] > 0),
+                        "inc_months": sum(1 for x in rows if x["inc"] > 0),
+                        "neg_months": sum(1 for x in rows if x["inc"] - x["exp"] < 0),
+                    }
+                    excluded["exp_avg"] = excluded["exp_total"] / n
+                    if not (ex_exp or ex_inc or excluded["exp_total"] or excluded["inc_total"]):
+                        excluded = None
 
                 tab_now, tab_ov, tab_cat, tab_fix, tab_settle, tab_tx = st.tabs(
                     ["ホーム", "概要", "カテゴリ", "固定費", "清算", "明細"])
@@ -2031,45 +2044,39 @@ if role:
                             # 第1階層 ホーム — 収入・支出・収支だけ。それ以外は下の階層へ
                             # ============================================================
                             def ex_block():
-                                """経常ベースから除いている分。実績でも見通しでもない第3の数字。
+                                """経常ベースから除いている分。**ホームは数字だけ**にする。
 
-                                ⚠️ **上限・使った額・着地見込み・貯蓄率はすべて経常ベース**で、
-                                特別な支出も臨時収入も入っていない。ここを出さないと、貯蓄率だけを
-                                見て「達成できている」と誤読する。サイドバーを切り替えなくても
-                                額が見えることが要件。
+                                ⚠️ 分析の文章（「9ヶ月は差引マイナス」等）はここに書かない。
+                                画面の文字数が増えると一目で読めなくなる。解釈は第2階層で読む。
 
-                                支出だけでなく**収入側も必ず並べる**。片側だけ出すと逆方向に
-                                誤解する（月によっては臨時収入のほうがずっと大きい）。
+                                一目で伝えるべきは1つだけ。**特別な支出の月あたり平均が
+                                上限に迫る規模だということ。**（実測で上限の8割）
+                                臨時収入は月平均を出さない。ほとんどの月がゼロなので、
+                                平均を出すと「毎月それだけ入る」と誤読される。
                                 """
                                 if not excluded:
                                     return ""
-                                e, i = excluded["exp"], excluded["inc"]
-                                yr, ye, yi = excluded["year"], excluded["y_exp"], excluded["y_inc"]
-
-                                def line(label, cur, ytd, sign):
-                                    v = f'{sign}{fyen(cur)}' if cur else "¥0"
-                                    sub = (f'（{yr}年の累計 {sign}{fyen(ytd)}）'
-                                           if ytd else "")
-                                    col = ERROR if (sign == "−" and cur) else (
-                                        GREEN_900 if (sign == "" and cur) else SUBTLE)
-                                    return (f'<tr><td class="k">{label}'
-                                            f'<span class="hc-ytd">{sub}</span></td>'
-                                            f'<td class="v" style="color:{col}">{v}</td></tr>')
-
-                                # 両方を戻した「全体ベース」の収支。実際の手残りに近いのはこちら
-                                real = kpi["balance"] - e + i
+                                x = excluded
+                                cap = r["cap"]
+                                pct = (f'　<span class="hc-ytd">上限の'
+                                       f'{x["exp_avg"] / cap * 100:.0f}%</span>') if cap > 0 else ""
+                                real = kpi["balance"] - x["exp"] + x["inc"]
+                                inc_note = (f'（{x["inc_months"]}/{x["n"]}ヶ月）'
+                                            if x["inc_months"] else f'（{x["n"]}ヶ月で0回）')
                                 return (
                                     f'<div class="hc-ex"><div class="hc-h">'
                                     f'経常ベースから除いている分</div><table>'
-                                    + line("特別な支出", e, ye, "−")
-                                    + line(f"臨時収入（{'・'.join(SPECIAL_INC_SUBS)}）", i, yi, "")
-                                    + f'<tr><td class="k"><b>これらを含めた収支</b></td>'
-                                      f'<td class="v"><b>{fyen(real)}</b></td></tr>'
-                                    + '</table><div class="hc-note">'
-                                      '上の収支・見通し・貯蓄率は、いずれもこの分を'
-                                      '<b>除いた</b>経常ベースです。'
-                                      'サイドバーのチェックを外すと全体に切り替わります。'
-                                      '</div></div>')
+                                    f'<tr><td class="k">特別な支出</td>'
+                                    f'<td class="v" style="color:{ERROR}">−{fyen(x["exp"])}</td></tr>'
+                                    f'<tr><td class="k">　月あたりの平均{pct}</td>'
+                                    f'<td class="v" style="color:{ERROR}">−{fyen(x["exp_avg"])}</td></tr>'
+                                    f'<tr><td class="k">臨時収入'
+                                    f'<span class="hc-ytd">{inc_note}</span></td>'
+                                    f'<td class="v" style="color:'
+                                    f'{GREEN_900 if x["inc"] else SUBTLE}">{fyen(x["inc"])}</td></tr>'
+                                    f'<tr><td class="k"><b>これらを含めた収支</b></td>'
+                                    f'<td class="v"><b>{fyen(real)}</b></td></tr>'
+                                    f'</table></div>')
 
                             def render_home():
                                 # 見通し。実績（上）とは性格が違うので同じ表に並べない。
@@ -2106,6 +2113,9 @@ if role:
                                     f'<td class="v">{fyen(kpi["balance"])}</td></tr>'
                                     f'</table>{fc}{ex_block()}</div>',
                                     unsafe_allow_html=True)
+                                if excluded and nav_row(
+                                        "special", "**特別費用を詳しく見る**", None):
+                                    nav_go(NAV_SPECIAL)
 
                                 # 予算カード。カード全体がタップ領域（MFのホームと同じ入口）
                                 if r["left_days"] > 0:
@@ -2477,6 +2487,78 @@ if role:
                                     "ここでは設定された割合で配った結果を表示しています。")
 
                             # ============================================================
+                            # 第2階層 特別費用 — 経常ベースから除いている分の推移
+                            #
+                            # ホームには数字だけを出し、解釈（頻度の偏り）はここで読む。
+                            # ============================================================
+                            def render_special():
+                                nav_header(NAV_SPECIAL)
+                                x = excluded
+                                if not x:
+                                    st.caption("この期間に除外している支出・収入はありません。")
+                                    return
+                                n, rows = x["n"], x["rows"]
+
+                                # ⚠️ 合計を並べるだけだと「均せば黒字」と読める。頻度を先に言う
+                                st.markdown(
+                                    f'<div class="forecast{"" if x["neg_months"] <= n / 2 else " warn"}">'
+                                    f'<div class="fc-icon">📉</div><div>'
+                                    f'<div class="fc-label">直近{n}ヶ月</div>'
+                                    f'<div class="fc-msg">差引がマイナスの月が '
+                                    f'<b style="color:{ERROR}">{x["neg_months"]}/{n}ヶ月</b>'
+                                    f'</div>'
+                                    f'<div class="fc-note">'
+                                    f'特別な支出は{x["exp_months"]}/{n}ヶ月で発生（月あたり '
+                                    f'{fyen(x["exp_avg"])}）、'
+                                    f'臨時収入は{x["inc_months"]}/{n}ヶ月のみ（計 '
+                                    f'{fyen(x["inc_total"])}）。'
+                                    f'ほとんどの月は特別な支出ぶんだけマイナスで、たまに入る'
+                                    f'大きな臨時収入がそれを埋める構造です。</div>'
+                                    f'</div></div>', unsafe_allow_html=True)
+
+                                fig = go.Figure()
+                                xs = [month_label(v["month"]) for v in rows]
+                                fig.add_trace(go.Bar(
+                                    x=xs, y=[-v["exp"] for v in rows], name="特別な支出",
+                                    marker_color=ERROR,
+                                    hovertemplate="%{y:,.0f}円<extra>特別な支出</extra>"))
+                                fig.add_trace(go.Bar(
+                                    x=xs, y=[v["inc"] for v in rows], name="臨時収入",
+                                    marker_color=GREEN_600,
+                                    hovertemplate="%{y:,.0f}円<extra>臨時収入</extra>"))
+                                fig.add_trace(go.Scatter(
+                                    x=xs, y=[v["inc"] - v["exp"] for v in rows], name="差引",
+                                    mode="lines+markers", line=dict(color=INK, width=2),
+                                    hovertemplate="%{y:,.0f}円<extra>差引</extra>"))
+                                fig.update_layout(barmode="relative")
+                                fig.add_hline(y=0, line=dict(color=SUBTLE, width=1))
+                                base_layout(fig, height=300, hover="x")
+                                st.plotly_chart(fig, width="stretch", key="special_trend",
+                                                config=PLOTLY_CONFIG)
+
+                                st.markdown("##### 月ごとの内訳")
+                                html_table(pd.DataFrame([
+                                    {"月": month_label(v["month"]),
+                                     "特別な支出": ("−" + fyen(v["exp"])) if v["exp"] else "—",
+                                     "件数": f'{v["ec"]}件' if v["ec"] else "—",
+                                     "臨時収入": fyen(v["inc"]) if v["inc"] else "—",
+                                     "差引": fyen(v["inc"] - v["exp"])}
+                                    for v in reversed(rows)]))
+
+                                st.markdown(f"##### {period_label}の特別な支出")
+                                d = pv[(pv["amount"] < 0)
+                                                 & pv["cat"].isin(SPECIAL_EXP_CATS)]
+                                if d.empty:
+                                    st.caption("この期間の特別な支出はありません。")
+                                else:
+                                    d = d.sort_values("amount")
+                                    html_table(pd.DataFrame([
+                                        {"日付": pd.Timestamp(t.date).strftime("%m/%d"),
+                                         "中項目": str(t.sub), "内容": str(t.content),
+                                         "金額": fyen(-t.amount)}
+                                        for t in d.itertuples()]))
+
+                            # ============================================================
                             # 第4階層 大項目の詳細
                             # ============================================================
                             def render_cat(cat: str):
@@ -2568,6 +2650,8 @@ if role:
                                 render_fixed()
                             elif view == NAV_CAT:
                                 render_cat(nav_cat)
+                            elif view == NAV_SPECIAL:
+                                render_special()
                             else:
                                 render_home()
                             # ⚠️ 描画の**後**に呼ぶ。前に置くと Streamlit のスクロール復元に
