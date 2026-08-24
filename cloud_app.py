@@ -225,6 +225,10 @@ JST = timezone(timedelta(hours=9))
 # → 非公開リポジトリの tools/measure_lag.py で測り直せる。変えるときは必ず再測定
 CARD_LAG_DAYS = 2
 BASELINE_WINDOW = 6        # 基準線に使う過去月数
+# 結果予想を晴/曇/雨に分ける中間帯の幅。変動費の「1日あたりの枠」の何日分か。
+# 着地見込みには誤差があるので、上限ちょうどで晴と雨を切り替えると表示が跳ねる。
+# 「あと何日ぶん調整すれば届くか」で決めているので、額が変わっても追随する
+FORECAST_BAND_DAYS = 3
 FREQ_HI, FREQ_LO = 0.9, 0.3  # 出現頻度の分岐（毎月 / 隔月等 / 不定期）
 BONUS_RE = r"賞与|ボーナス"
 BONUS_SUB = "賞与"
@@ -339,6 +343,32 @@ def sub_active(item: dict) -> bool:
     if s:
         return s == "利用中"
     return not str(item.get("ended") or "").strip()   # 旧データ互換
+
+
+ST_ON, ST_PAUSE, ST_OFF = "利用中", "停止中", "解約済み"
+
+
+def _sub_state(item: dict) -> str:
+    """契約の状態。旧データは status を持たないので ended から補う。"""
+    s = str(item.get("status") or "").strip()
+    if s in (ST_ON, ST_PAUSE, ST_OFF):
+        return s
+    return ST_OFF if str(item.get("ended") or "").strip() else ST_ON
+
+
+def _sub_row(item: dict, fx: dict) -> dict:
+    """一覧の1行。項目はローカル版の契約マスタと同じものを出す。"""
+    cyc = int(item.get("cycle_months") or 1)
+    cur = str(item.get("currency") or "JPY").upper()
+    amt = float(item.get("amount") or 0)
+    return {
+        "サービス名": str(item.get("name") or ""),
+        "カテゴリ": str(item.get("category") or "—"),
+        "金額": (fyen(amt) if cur == "JPY" else f"{amt:,.2f} {cur}"),
+        "周期": ("月額" if cyc == 1 else "年額" if cyc == 12 else f"{cyc}ヶ月ごと"),
+        "月あたり": fyen(sub_monthly(item, fx)),
+        "状態": _sub_state(item),
+    }
 
 
 def _norm_content(s) -> str:
@@ -1578,6 +1608,8 @@ st.markdown(f"""<style>
     border: 1px solid {GREEN_200}; padding: 18px 20px; margin: 6px 0 20px;
     display: flex; align-items: center; gap: 16px; }}
   .forecast.warn {{ background: #FDF0F0; border-color: #F3B0B0; }}
+  /* 中間（曇り）はどちらにも転びうる状態。晴と混ぜず無彩色にする */
+  .forecast.edge {{ background: {PAPER}; border-color: {LINE}; }}
   .forecast .fc-icon {{ font-size: 38px; line-height: 1; }}
   .forecast .fc-label {{ font-size: 12px; color: {SUBTLE}; font-weight: 600; }}
   .forecast .fc-msg {{ font-size: 21px; font-weight: 600; line-height: 1.4;
@@ -1911,6 +1943,27 @@ if role:
                             cap_pct = (r["spent"] / r["cap"] * 100) if r["cap"] > 0 else None
                             landing_over = (land - r["cap"]) if land is not None else None
 
+                            def forecast_state():
+                                """結果予想の3段階。(記号, 種別, 中間帯の幅) を返す。
+
+                                上限ちょうどを境に晴/雨を切り替えると、着地見込みのわずかな差で
+                                表示が跳ねる。見込みには誤差があるので、**変動費の1日あたりの枠 ×
+                                FORECAST_BAND_DAYS 日分**を中間帯（曇り）にして、そこを超えたときだけ
+                                晴か雨に振る。「あと数日ぶん調整すれば届く」＝どちらに転んでも
+                                おかしくない、という意味づけ。額が変わっても自動で追随する。
+
+                                ⚠️ 1日あたりの枠に r["per_day"] を使ってはいけない。予算超過中は
+                                0 になるので、中間帯が消えて常に雨になる。月間の枠を日数で割る。
+                                """
+                                band = (total_budget / dim) * FORECAST_BAND_DAYS if dim else 0
+                                if landing_over is None:
+                                    return None, None, band
+                                if landing_over > band:
+                                    return "🌧️", "over", band
+                                if landing_over < -band:
+                                    return "☀️", "under", band
+                                return "⛅", "edge", band
+
                             def cell(label, value, sub, color=INK, size="ph-big", cls="ph"):
                                 return (f'<div class="{cls}"><div class="ph-label">{label}</div>'
                                         f'<div class="{size}" style="color:{color}">{value}</div>'
@@ -1992,10 +2045,15 @@ if role:
                                 body = (f"支出 {fyen(r['spent'])}　＋今後 {fyen(r['upcoming'])}　　"
                                         + (f"残り **{fyen(r['remain'])}**" if not over
                                            else f":red[**{fyen(-r['remain'])} 超過**]"))
-                                if landing_over is not None and landing_over > 0:
-                                    tail = f"\n\n⛅ :red[このままだと予算を {fyen(landing_over)} 超えそう]"
-                                elif landing_over is not None:
-                                    tail = f"\n\n☀️ このままなら {fyen(-landing_over)} 余りそう"
+                                # 第2階層の結果予想と同じ判定を使う（別々に書くとずれる）
+                                h_icon, h_kind, _ = forecast_state()
+                                if h_kind == "over":
+                                    tail = (f"\n\n{h_icon} :red[このままだと予算を "
+                                            f"{fyen(landing_over)} 超えそう]")
+                                elif h_kind == "under":
+                                    tail = f"\n\n{h_icon} このままなら {fyen(-landing_over)} 余りそう"
+                                elif h_kind == "edge":
+                                    tail = f"\n\n{h_icon} ぎりぎり予算どおりに着地しそう"
                                 else:
                                     tail = "\n\n着地の見込みは月初のうちは出しません"
                                 # バーの空白＝残り になるよう、今後落ちる固定費まで塗る
@@ -2015,28 +2073,31 @@ if role:
                                            f"{int(pace_month[5:7])}月1日〜{int(pace_month[5:7])}月{dim}日）")
 
                                 # ⚠️ 生HTMLなので Markdown の ** は効かない。<b> を使う
-                                if landing_over is not None and landing_over > 0:
+                                icon, kind, band = forecast_state()
+                                if kind == "over":
+                                    msg = (f'予算を <b style="color:{ERROR}">'
+                                           f'{fyen(landing_over)}</b> 超えちゃいそう。')
+                                    note = "最後まであきらめないで。"
+                                elif kind == "under":
+                                    msg = (f'このままなら <b style="color:{GREEN_900}">'
+                                           f'{fyen(-landing_over)}</b> 余りそう。')
+                                    note = ""
+                                elif kind == "edge":
+                                    msg = ('<b>ぎりぎり予算どおり</b>に着地しそう。')
+                                    note = (f"上限との差は {fyen(abs(landing_over))}。"
+                                            f"1日あたり{FORECAST_BAND_DAYS}日ぶんの調整で"
+                                            "どちらにも転びます。")
+                                if kind:
+                                    cls = {"over": " warn", "edge": " edge"}.get(kind, "")
                                     st.markdown(
-                                        f'<div class="forecast warn">'
-                                        f'<div class="fc-icon">⛅</div><div>'
+                                        f'<div class="forecast{cls}">'
+                                        f'<div class="fc-icon">{icon}</div><div>'
                                         f'<div class="fc-label">結果予想</div>'
-                                        f'<div class="fc-msg">予算を '
-                                        f'<b style="color:{ERROR}">{fyen(landing_over)}</b> '
-                                        f'超えちゃいそう。</div>'
+                                        f'<div class="fc-msg">{msg}</div>'
                                         f'<div class="fc-note">着地の見込み {fyen(land)} '
-                                        f'／ 上限 {fyen(r["cap"])}。最後まであきらめないで。</div>'
-                                        f'</div></div>', unsafe_allow_html=True)
-                                elif landing_over is not None:
-                                    st.markdown(
-                                        f'<div class="forecast">'
-                                        f'<div class="fc-icon">☀️</div><div>'
-                                        f'<div class="fc-label">結果予想</div>'
-                                        f'<div class="fc-msg">このままなら '
-                                        f'<b style="color:{GREEN_900}">{fyen(-landing_over)}</b> '
-                                        f'余りそう。</div>'
-                                        f'<div class="fc-note">着地の見込み {fyen(land)} '
-                                        f'／ 上限 {fyen(r["cap"])}</div>'
-                                        f'</div></div>', unsafe_allow_html=True)
+                                        f'／ 上限 {fyen(r["cap"])}'
+                                        + (f"。{note}" if note else "")
+                                        + '</div></div></div>', unsafe_allow_html=True)
 
                                 days_txt = (f'あと<b>{r["left_days"]}</b>日'
                                             if r["left_days"] > 0 else "この月は終了")
@@ -2577,6 +2638,34 @@ if role:
                     c2.metric("変動費", fyen(var_amt))
                     c3.metric("固定費率", f"{ratio:.1f}%" if ratio is not None else "—")
                     st.caption(f"固定費の定義 — 大項目: {'・'.join(f_cats)} ／ 中項目: {'・'.join(f_subs)}")
+
+                    # ---- 契約中のサブスク一覧（閲覧のみ） ----
+                    # ⚠️ **契約マスタが正。実績側から推測して足さない。**
+                    # 実績にあってマスタに無いものは、解約済み・単発の支出・別表記の
+                    # いずれかであって「取りこぼした固定費」ではない。
+                    # 登録・編集はローカル版だけの機能なので、ここは表示に徹する。
+                    _subs = load_subs()
+                    _fx = _subs.get("fx", {})
+                    _items = _subs.get("items", [])
+                    st.markdown("##### 契約中のサブスク")
+                    if _items:
+                        live = [x for x in _items if _sub_state(x) != ST_OFF]
+                        gone = [x for x in _items if _sub_state(x) == ST_OFF]
+                        live.sort(key=lambda x: -sub_monthly(x, _fx))
+                        on = [x for x in live if _sub_state(x) == ST_ON]
+                        st.caption(
+                            f"利用中は {len(on)}件・月あたり合計 **{fyen(sum(sub_monthly(x, _fx) for x in on))}**。"
+                            "停止中は合計に入れていません。"
+                            "　登録・解約の管理はローカル版で行います。")
+                        if live:
+                            html_table(pd.DataFrame([_sub_row(x, _fx) for x in live]))
+                        if gone:
+                            gone.sort(key=lambda x: -sub_monthly(x, _fx))
+                            with st.expander(f"▼ 解約済み（{len(gone)}件）"):
+                                html_table(pd.DataFrame([_sub_row(x, _fx) for x in gone]))
+                    else:
+                        st.caption("契約マスタがバンドルに入っていません。"
+                                   "ローカルで update_cloud_data.bat を実行すると出ます。")
 
                     pv = scoped_all[scoped_all["amount"] < 0].copy()
                     pv["kind"] = "変動費"
