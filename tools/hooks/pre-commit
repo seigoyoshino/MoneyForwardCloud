@@ -1,0 +1,38 @@
+#!/bin/sh
+# main の上でのコミットを機械的に止める（CLAUDE.md ルール6）。
+#
+# なぜフックなのか: 「編集の前にブランチを確認する」というルールは 3回破られた。
+# 3回とも経路は同じで、update_cloud_data.bat が main を要求するため、実行後に
+# HEAD が main に残り、そのまま次の作業を始めてしまう。
+# 思い出す前提の手順は当てにならないので、思い出さなくても止まる形にする。
+#
+# 迂回: git commit --no-verify
+
+set -u
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+case "$branch" in
+    main|master) ;;
+    *) exit 0 ;;
+esac
+
+# ステージされたパス。すべて cloud_data/ 配下ならバンドル更新とみなして通す
+staged=$(git diff --cached --name-only)
+[ -z "$staged" ] && exit 0
+if ! printf '%s\n' "$staged" | grep -qv '^cloud_data/'; then
+    exit 0
+fi
+
+RED=$(printf '\033[31m'); OFF=$(printf '\033[0m')
+printf '%s✗ %s の上でコミットしようとしています%s\n' "$RED" "$branch" "$OFF"
+printf '%s\n' "$staged" | head -10 | sed 's/^/    /'
+cat <<'MSG'
+
+  main では編集しません（CLAUDE.md 最重要のルール6）。
+  作業はブランチを切ってから行ってください。
+
+    git switch -c <branch>          # そのまま今の変更を持っていけます
+
+  意図的に main へコミットする場合のみ:  git commit --no-verify
+MSG
+exit 1
