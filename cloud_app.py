@@ -1563,8 +1563,10 @@ st.markdown(f"""<style>
     line-height: 1.5; }}
   /* 経常ベースから除いている分。実績でも見通しでもない第3の数字なので、
      見通し（破線・背景あり）とも区別できるよう実線・背景なしにする */
-  .homecard .hc-ex {{ margin: 0 -20px -18px; padding: 13px 20px 15px;
-    border-top: 1px solid {LINE}; }}
+  .homecard .hc-ex {{ padding: 0; }}
+  /* 見通し・特別費用は独立カード。実績カードより一段控えめにする */
+  .homecard.tight {{ padding: 14px 20px 16px; }}
+  .homecard .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
   .homecard .hc-ex .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
   .homecard .hc-ex table {{ margin-top: 6px; }}
   .homecard .hc-ex td {{ padding: 5px 0; }}
@@ -2079,28 +2081,16 @@ if role:
                                     f'</table></div>')
 
                             def render_home():
-                                # 見通し。実績（上）とは性格が違うので同じ表に並べない。
-                                # ⚠️ 収支はサイドバーのトグルに従う集計、今後落ちる固定費は
-                                # ペース計算の集計（経常ベース固定・按分後・年次費用の月割り込み）。
-                                # 土台が違うので、引き算の結果は目安として読む
-                                fc_bal = kpi["balance"] - r["upcoming"]
-                                fc_day = (f'{fyen(r["per_day"])}<span style="font-size:13px"> / 日</span>'
-                                          if r["per_day"] else ("¥0" if over else "—"))
-                                fc = (
-                                    f'<div class="hc-fc"><div class="hc-h">見通し</div><table>'
-                                    f'<tr><td class="k">今後の固定費 {fyen(r["upcoming"])} を'
-                                    f'引いた収支</td>'
-                                    f'<td class="v" style="color:'
-                                    f'{GREEN_900 if fc_bal >= 0 else ERROR}">{fyen(fc_bal)}</td></tr>'
-                                    f'<tr><td class="k">予算に対して1日あたり使えるのは</td>'
-                                    f'<td class="v" style="color:'
-                                    f'{GREEN_900 if r["per_day"] else SUBTLE}">{fc_day}</td></tr>'
-                                    f'</table>'
-                                    f'<div class="hc-note">上は実績、ここから下は<b>目安</b>です。'
-                                    f'1日あたりは残り{r["left_days"]}日で割った額（詳しくは「予算」へ）。'
-                                    f'　※ 収支はサイドバーの設定に従う集計、今後の固定費は'
-                                    f'ペース計算の集計（按分後・年次費用の月割り込み）で土台が'
-                                    f'違うため、引き算の結果は概算です。</div></div>')
+                                """第1階層。**日々見る順に並べる。**
+
+                                上から 実績 → 予算 → 見通し → 特別費用。予算がいちばん頻繁に
+                                見るものなので実績の直後に置く。特別費用はたまに確認するもの
+                                なのでいちばん下。
+
+                                ⚠️ **注記・説明はここに書かない。** すべて ⓘ に畳む。
+                                数字とラベルだけが常時見えている状態を保つ。
+                                """
+                                # ---- 実績 ----
                                 st.markdown(
                                     f'<div class="homecard">'
                                     f'<div class="hc-ttl">家計簿<span>{period_label}</span></div>'
@@ -2111,13 +2101,10 @@ if role:
                                     f'<td class="v" style="color:{SHU}">−{fyen(kpi["expense"])}</td></tr>'
                                     f'<tr><td class="k">収支</td>'
                                     f'<td class="v">{fyen(kpi["balance"])}</td></tr>'
-                                    f'</table>{fc}{ex_block()}</div>',
+                                    f'</table></div>',
                                     unsafe_allow_html=True)
-                                if excluded and nav_row(
-                                        "special", "**特別費用を詳しく見る**", None):
-                                    nav_go(NAV_SPECIAL)
 
-                                # 予算カード。カード全体がタップ領域（MFのホームと同じ入口）
+                                # ---- 予算（いちばん頻繁に見るので実績の直後） ----
                                 if r["left_days"] > 0:
                                     head = f"**予算**　　あと {r['left_days']} 日"
                                 else:
@@ -2136,13 +2123,44 @@ if role:
                                 elif h_kind == "edge":
                                     tail = f"\n\n{h_icon} ぎりぎり予算どおりに着地しそう"
                                 else:
-                                    tail = "\n\n着地の見込みは月初のうちは出しません"
-                                # バーの空白＝残り になるよう、今後落ちる固定費まで塗る
+                                    tail = ""
                                 upc_pct = ((r["spent"] + r["upcoming"]) / r["cap"] * 100
                                            if r["cap"] > 0 else None)
                                 if nav_row("budget", f"{head}\n\n{body}{tail}",
                                            cap_pct, upc_pct, over=over):
                                     nav_go(NAV_BUDGET)
+
+                                # ---- 見通し（注記は ⓘ に畳む） ----
+                                fc_bal = kpi["balance"] - r["upcoming"]
+                                fc_day = (f'{fyen(r["per_day"])}<span style="font-size:13px"> / 日</span>'
+                                          if r["per_day"] else ("¥0" if over else "—"))
+                                st.markdown(
+                                    f'<div class="homecard tight">'
+                                    f'<div class="hc-h">見通し</div><table>'
+                                    f'<tr><td class="k">今後の固定費 {fyen(r["upcoming"])} を'
+                                    f'引いた収支</td>'
+                                    f'<td class="v" style="color:'
+                                    f'{GREEN_900 if fc_bal >= 0 else ERROR}">{fyen(fc_bal)}</td></tr>'
+                                    f'<tr><td class="k">予算に対して1日あたり使えるのは</td>'
+                                    f'<td class="v" style="color:'
+                                    f'{GREEN_900 if r["per_day"] else SUBTLE}">{fc_day}</td></tr>'
+                                    f'</table></div>',
+                                    unsafe_allow_html=True)
+                                st.caption(
+                                    ":grey[ⓘ ここから下は目安です]",
+                                    help=f"1日あたりは残り{r['left_days']}日で割った額です"
+                                         "（詳しくは「予算」へ）。\n\n"
+                                         "収支はサイドバーの設定に従う集計、今後の固定費は"
+                                         "ペース計算の集計（按分後・年次費用の月割り込み）で"
+                                         "土台が違うため、引き算の結果は概算です。")
+
+                                # ---- 特別費用（たまに確認するものなので最下部） ----
+                                ex = ex_block()
+                                if ex:
+                                    st.markdown(f'<div class="homecard tight">{ex}</div>',
+                                                unsafe_allow_html=True)
+                                    if nav_row("special", "**特別費用を詳しく見る**", None):
+                                        nav_go(NAV_SPECIAL)
                                 freshness_caption()
 
                             # ============================================================
@@ -2842,24 +2860,6 @@ if role:
                     fig.update_layout(barmode="stack")
                     st.plotly_chart(base_layout(fig, height=300), width="stretch",
                                     config=PLOTLY_CONFIG)
-
-                    subs_all = valid[(valid["sub"] == "サブスク") & (valid["amount"] < 0)]
-                    if not subs_all.empty:
-                        st.subheader("サブスクリプション一覧")
-                        g = subs_all.groupby("content").agg(
-                            累計=("amount", lambda s: -s.sum()), 出現月数=("month", "nunique"),
-                            直近月=("month", "max"))
-                        latest_amt = (subs_all.sort_values("month").groupby("content").tail(1)
-                                      .set_index("content")["amount"] * -1)
-                        g["直近の請求"] = latest_amt
-                        g["月平均"] = g["累計"] / g["出現月数"]
-                        g = g.sort_values("月平均", ascending=False).reset_index()
-                        html_table(pd.DataFrame({
-                            "サービス": g["content"],
-                            "直近の請求": g["直近の請求"].map(fyen),
-                            "月平均": g["月平均"].map(fyen),
-                            "出現月数": g["出現月数"], "累計": g["累計"].map(fyen),
-                        }))
 
                 # ---- 清算 ----
                 with tab_settle:
