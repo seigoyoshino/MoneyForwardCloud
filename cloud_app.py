@@ -84,6 +84,24 @@ def month_label(m: str) -> str:
 
 HOVER_YEN = "%{y:,.0f}円<extra>%{fullData.name}</extra>"
 
+def kpi_card(k: dict, label: str) -> str:
+    """収入・支出・収支の実績カード（HTML）。
+
+    ホームと概要タブで同じものを使う。片方だけ直すと見た目がずれるので、
+    HTMLを書き写さずここを呼ぶこと。
+    """
+    return (f'<div class="homecard">'
+            f'<div class="hc-ttl">家計簿<span>{label}</span></div>'
+            f'<table>'
+            f'<tr><td class="k">収入</td>'
+            f'<td class="v" style="color:{GREEN_900}">{fyen(k["income"])}</td></tr>'
+            f'<tr><td class="k">支出</td>'
+            f'<td class="v" style="color:{SHU}">−{fyen(k["expense"])}</td></tr>'
+            f'<tr><td class="k">収支</td>'
+            f'<td class="v">{fyen(k["balance"])}</td></tr>'
+            f'</table></div>')
+
+
 def html_table(df, height: int | None = None, **_ignored):
     """数値列を右揃えにした自前HTMLテーブルを描画する。
     Streamlit標準の表はCanvasに描画されるため文字揃えを変更できず、代わりにこれを使う。
@@ -2091,18 +2109,8 @@ if role:
                                 数字とラベルだけが常時見えている状態を保つ。
                                 """
                                 # ---- 実績 ----
-                                st.markdown(
-                                    f'<div class="homecard">'
-                                    f'<div class="hc-ttl">家計簿<span>{period_label}</span></div>'
-                                    f'<table>'
-                                    f'<tr><td class="k">収入</td>'
-                                    f'<td class="v" style="color:{GREEN_900}">{fyen(kpi["income"])}</td></tr>'
-                                    f'<tr><td class="k">支出</td>'
-                                    f'<td class="v" style="color:{SHU}">−{fyen(kpi["expense"])}</td></tr>'
-                                    f'<tr><td class="k">収支</td>'
-                                    f'<td class="v">{fyen(kpi["balance"])}</td></tr>'
-                                    f'</table></div>',
-                                    unsafe_allow_html=True)
+                                st.markdown(kpi_card(kpi, period_label),
+                                            unsafe_allow_html=True)
 
                                 # ---- 予算（いちばん頻繁に見るので実績の直後） ----
                                 if r["left_days"] > 0:
@@ -2678,6 +2686,9 @@ if role:
 
                 # ---- 概要 ----
                 with tab_ov:
+                    # タブ上の常時KPIを廃止したので、ここで全体の数字を出す
+                    st.markdown(kpi_card(kpi, period_label),
+                                unsafe_allow_html=True)
                     if mode == "年":
                         st.subheader("年次推移")
                         rows = []
