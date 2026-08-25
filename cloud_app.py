@@ -22,17 +22,26 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ---------- カラーパレット（Green基調） ----------
-INK = "#000000"
-SUBTLE = "#626264"
-PAPER = "#F8F8FB"
-LINE = "#E0E0E3"
+# ==== SHARED THEME TOKENS START ====
+# ⚠️ ここから SHARED THEME TOKENS END までは Local/Cloud で一字一句同じにする。
+# tools/check_theme_sync.py がこの範囲をテキスト比較する（PR #8のような
+# 移植漏れを機械的に検出するため）。増減・言い換えをしたら両方に必ず反映すること。
+# ---------- カラーパレット（深緑×金・デザイン全面改訂 段階1: 土台） ----------
+# ⚠️ 意味色（GOOD/OVER/PENDING）と装飾のブランド色（GREEN系・GOLD）は
+# 役割を明確に分ける。GREEN系は「良好」の意味に使わない（段階2で移行）。
+INK = "#17140F"        # Text（純黒よりわずかに温かい）
+SUBTLE = "#6B6357"     # Label
+LINE_SOFT = "#E4DFD1"  # 表の行区切りなど、内部の弱い罫線
+PAPER = "#F1EDE2"      # 背景・二次パネル（暖色寄りのオフホワイト）
+LINE = "#CBC2AE"       # 罫線・カード外枠（旧来より濃く、太さも1.5pxへ）
 GREEN_1200, GREEN_900, GREEN_600 = "#032213", "#115A36", "#259D63"
 GREEN_400, GREEN_200, GREEN_50 = "#51B883", "#9BD4B5", "#E6F5EC"
 CYAN_800, CYAN_600, CYAN_400 = "#006F83", "#00A3BF", "#2BC8E4"
 GRAY_800, GRAY_600, GRAY_400, GRAY_200 = "#333333", "#666666", "#999999", "#CCCCCC"
 SUCCESS, ERROR = "#197A4B", "#CE0000"
-INDIGO, SHU = GREEN_900, GRAY_600
+INDIGO = GREEN_900     # 収入・黒字（Primary Green 900）
+SHU = GRAY_600         # 支出（Negative = SolidGray 600）
+# ==== SHARED THEME TOKENS END ====
 
 CAT_COLORS = {
     "住宅": GREEN_1200, "食費": GREEN_900, "趣味・娯楽": GREEN_600,
@@ -1474,17 +1483,33 @@ def render_settlement(master: pd.DataFrame, months: list[str], settle: dict):
 # ============================================================
 st.set_page_config(page_title="家計ダッシュボード", page_icon="🧾", layout="wide")
 st.markdown(f"""<style>
+  /* ==== SHARED THEME CSS START ====
+     ⚠️ ここから SHARED THEME CSS END までは Local/Cloud で一字一句同じにする。
+     tools/check_theme_sync.py がこの範囲をテキスト比較する。
+     清算タブなど「構成が違ってよい」画面のCSSはこの範囲の外に書くこと。 */
   [data-testid="stMetricValue"] {{ font-variant-numeric: tabular-nums; }}
+  /* KPIカードの数値を右揃えにする */
   [data-testid="stMetricValue"], [data-testid="stMetricDelta"] {{
     display: flex; justify-content: flex-end; text-align: right;
   }}
+  /* 自前HTMLテーブル（数値右揃え用） */
   table.ntab {{ width: 100%; border-collapse: collapse; font-size: 13px;
     font-variant-numeric: tabular-nums; }}
+  table.ntab th {{ color: {SUBTLE}; font-weight: 500; font-size: 12px;
+    padding: 8px 12px; border-bottom: 1.5px solid {LINE};
+    background: #FFFFFF; position: sticky; top: 0; white-space: nowrap; }}
+  table.ntab td {{ padding: 7px 12px; border-bottom: 1px solid {LINE_SOFT};
+    vertical-align: top; }}
+  table.ntab tr:last-child td {{ border-bottom: none; }}
+  /* グラフ上のカーソルを十字ではなく指差しポインタにする */
+  [data-testid="stPlotlyChart"] .nsewdrag,
+  [data-testid="stPlotlyChart"] .drag,
+  [data-testid="stPlotlyChart"] .draglayer rect {{ cursor: pointer !important; }}
   /* 「今月」タブの結論カード（清算ビューの .settle-hero と同じ考え方） */
   .pace-hero {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px;
-    background: {LINE}; border: 1px solid {LINE}; border-radius: 12px;
-    overflow: hidden; margin: 4px 0 14px; }}
-  .pace-hero .ph {{ background: #FFFFFF; padding: 16px 18px; }}
+    background: {LINE}; border: 1.5px solid {LINE}; border-radius: 7px;
+    overflow: hidden; margin: 4px 0 10px; }}
+  .pace-hero .ph {{ background: #FFFFFF; padding: 14px 16px; }}
   .pace-hero .ph-label {{ color: {SUBTLE}; font-size: 12px; line-height: 1.4; }}
   .pace-hero .ph-big {{ font-size: 34px; font-weight: 600; line-height: 1.2;
     font-variant-numeric: tabular-nums; margin-top: 2px; }}
@@ -1503,16 +1528,24 @@ st.markdown(f"""<style>
     .pace-hero {{ grid-template-columns: 1fr; }}
     .pace-hero .ph-big {{ font-size: 30px; }}
   }}
-  table.ntab th {{ color: {SUBTLE}; font-weight: 500; font-size: 12px;
-    padding: 8px 12px; border-bottom: 1px solid {LINE};
-    background: #FFFFFF; position: sticky; top: 0; white-space: nowrap; }}
-  table.ntab td {{ padding: 7px 12px; border-bottom: 1px solid #F0F0F2;
-    vertical-align: top; }}
-  table.ntab tr:last-child td {{ border-bottom: none; }}
+  /* 今月タブの固定費サマリー1行。MFの予算画面と同じ「予算・支出・残り」の形。
+     金額としては画面で一番大きいので、変動費と同じ強さで置く（薄くしない） */
+  .fixrow {{ border: 1.5px solid {LINE}; border-radius: 7px; background: #FFFFFF;
+    padding: 13px 16px; margin: 2px 0 8px; }}
+  .fixrow .fx-head {{ display: flex; justify-content: space-between;
+    align-items: baseline; gap: 10px; }}
+  .fixrow .fx-name {{ font-size: 13px; color: {INK}; font-weight: 600; }}
+  .fixrow .fx-amt {{ font-size: 26px; font-weight: 600; white-space: nowrap;
+    font-variant-numeric: tabular-nums; line-height: 1.25; }}
+  .fixrow .fx-bar {{ height: 7px; border-radius: 4px; background: {LINE};
+    margin: 9px 0 6px; overflow: hidden; }}
+  .fixrow .fx-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .fixrow .fx-sub {{ color: {SUBTLE}; font-size: 12px;
+    font-variant-numeric: tabular-nums; }}
   /* 変動費の費目別進捗（スマホ想定の2行構成） */
-  .vprog {{ border: 1px solid {LINE}; border-radius: 8px; background: #FFFFFF;
-    overflow: hidden; margin: 2px 0 10px; }}
-  .vprog .vp {{ padding: 9px 12px; border-bottom: 1px solid #F0F0F2; }}
+  .vprog {{ border: 1.5px solid {LINE}; border-radius: 7px; background: #FFFFFF;
+    overflow: hidden; margin: 2px 0 8px; }}
+  .vprog .vp {{ padding: 9px 12px; border-bottom: 1px solid {LINE_SOFT}; }}
   .vprog .vp:last-child {{ border-bottom: none; }}
   .vprog .vp-head {{ display: flex; justify-content: space-between;
     align-items: baseline; gap: 10px; }}
@@ -1525,9 +1558,10 @@ st.markdown(f"""<style>
   /* 4分類のラベル。要チェックだけ目に入るよう、想定内は無彩色にする */
   .vprog .vp-tag {{ display: inline-block; font-size: 11px; line-height: 1.6;
     padding: 0 6px; margin-right: 6px; border-radius: 3px; font-weight: 600;
-    vertical-align: 1px; white-space: nowrap; }}
-  .vprog .vp-tag {{ background: {PAPER}; color: {SUBTLE}; }}
-  /* 大項目の予算進捗バー。並びは予算順で固定し、超過は色と🔥で拾わせる */
+    vertical-align: 1px; white-space: nowrap;
+    background: {PAPER}; color: {SUBTLE}; }}
+  /* 大項目の予算進捗バー。並びは予算順で固定し、超過は色と🔥で拾わせる
+     （超過行を上へ動かすと月内で位置が変わり、目で覚えられなくなる） */
   .vprog .vp-bar {{ height: 6px; border-radius: 3px; background: {LINE};
     margin: 6px 0 5px; overflow: hidden; }}
   .vprog .vp-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
@@ -1544,11 +1578,11 @@ st.markdown(f"""<style>
   .st-key-navback button:hover {{ background: {GREEN_50}; }}
   /* 次の階層へ進む行。行全体がタップ領域。バーは ::after で描く
      （ボタンのラベルにHTMLを入れられないため） */
-  div[class*="st-key-navrow-"] {{ margin-bottom: 8px; }}
+  div[class*="st-key-navrow-"] {{ margin-bottom: 6px; }}
   div[class*="st-key-navrow-"] button {{
     position: relative; width: 100%; min-height: 76px;
     padding: 12px 30px 16px 16px; text-align: left; justify-content: flex-start;
-    align-items: flex-start; border: 1px solid {LINE}; border-radius: 10px;
+    align-items: flex-start; border: 1.5px solid {LINE}; border-radius: 7px;
     background: #FFFFFF; overflow: hidden; }}
   div[class*="st-key-navrow-"] button:hover {{ border-color: {GREEN_400};
     background: {GREEN_50}; }}
@@ -1570,8 +1604,8 @@ st.markdown(f"""<style>
     font-variant-numeric: tabular-nums; margin: 0; }}
   div[class*="st-key-navrow-"] button p:first-child {{ font-size: 14px; }}
   /* ---- 第1階層のカード（収入・支出・収支） ---- */
-  .homecard {{ border: 1px solid {LINE}; border-radius: 12px; background: #FFFFFF;
-    padding: 18px 20px; margin: 4px 0 14px; }}
+  .homecard {{ border: 1.5px solid {LINE}; border-radius: 7px; background: #FFFFFF;
+    padding: 16px 18px; margin: 4px 0 10px; }}
   .homecard .hc-ttl {{ font-size: 13px; font-weight: 600; color: {INK}; }}
   .homecard .hc-ttl span {{ color: {SUBTLE}; font-weight: 400; margin-left: 8px; }}
   .homecard table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
@@ -1582,9 +1616,9 @@ st.markdown(f"""<style>
     line-height: 1.2; white-space: nowrap; }}
   /* 見通しは実績と性格が違う数字。破線・背景・小見出しの3つで別物だと示し、
      金額も一段小さくして実績を主に保つ */
-  .homecard .hc-fc {{ margin: 16px -20px -18px; padding: 13px 20px 15px;
+  .homecard .hc-fc {{ margin: 14px -18px -16px; padding: 12px 18px 14px;
     background: {PAPER}; border-top: 1px dashed {GRAY_400};
-    border-radius: 0 0 12px 12px; }}
+    border-radius: 0 0 7px 7px; }}
   .homecard .hc-fc .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
   .homecard .hc-fc table {{ margin-top: 6px; }}
   .homecard .hc-fc td {{ padding: 5px 0; }}
@@ -1596,7 +1630,7 @@ st.markdown(f"""<style>
      見通し（破線・背景あり）とも区別できるよう実線・背景なしにする */
   .homecard .hc-ex {{ padding: 0; }}
   /* 見通し・特別費用は独立カード。実績カードより一段控えめにする */
-  .homecard.tight {{ padding: 14px 20px 16px; }}
+  .homecard.tight {{ padding: 13px 18px 14px; }}
   .homecard .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
   .homecard .hc-ex .hc-h {{ font-size: 12px; font-weight: 600; color: {SUBTLE}; }}
   .homecard .hc-ex table {{ margin-top: 6px; }}
@@ -1607,7 +1641,7 @@ st.markdown(f"""<style>
   .homecard .hc-ex .hc-note {{ font-size: 11px; color: {SUBTLE}; margin-top: 7px;
     line-height: 1.5; }}
   /* ---- 第2階層の全体バー ---- */
-  .totbar {{ margin: 6px 0 18px; }}
+  .totbar {{ margin: 6px 0 14px; }}
   .totbar .tb-days {{ text-align: center; font-size: 13px; color: {SUBTLE};
     margin-bottom: 10px; }}
   .totbar .tb-days b {{ font-size: 30px; font-weight: 600; color: {INK};
@@ -1657,8 +1691,8 @@ st.markdown(f"""<style>
   .st-key-navcrumb .crumb-sep {{ font-family: "Segoe UI", system-ui, sans-serif;
     font-size: 15px; color: {GRAY_400}; }}
   /* ---- 結果予想。第2階層でいちばん目立つ要素にする ---- */
-  .forecast {{ border-radius: 12px; background: {GREEN_50};
-    border: 1px solid {GREEN_200}; padding: 18px 20px; margin: 6px 0 20px;
+  .forecast {{ border-radius: 7px; background: {GREEN_50};
+    border: 1.5px solid {GREEN_200}; padding: 16px 18px; margin: 6px 0 14px;
     display: flex; align-items: center; gap: 16px; }}
   .forecast.warn {{ background: #FDF0F0; border-color: #F3B0B0; }}
   /* 中間（曇り）はどちらにも転びうる状態。晴と混ぜず無彩色にする */
@@ -1673,11 +1707,14 @@ st.markdown(f"""<style>
     .forecast .fc-msg {{ font-size: 17px; }}
     .forecast .fc-msg b {{ font-size: 22px; }}
   }}
-  div[data-testid="stMetric"] {{ background:#FFF; border:1px solid {LINE};
-      border-radius:8px; padding:12px 16px; }}
+  h1, h2, h3 {{ letter-spacing: .03em; }}
+  div[data-testid="stMetric"] {{
+    background: #FFFFFF; border: 1.5px solid {LINE}; border-radius: 7px; padding: 12px 16px;
+  }}
+  /* ==== SHARED THEME CSS END ==== */
   /* 清算ビューの結論カード。st.metric では値の文字サイズを変えられないため自前で描く */
-  .settle-hero {{ background:{GREEN_50}; border:1px solid {GREEN_900};
-      border-radius:12px; padding:16px 18px; margin:6px 0 18px; }}
+  .settle-hero {{ background:{GREEN_50}; border:1.5px solid {GREEN_900};
+      border-radius:7px; padding:16px 18px; margin:6px 0 14px; }}
   .settle-hero .cap {{ font-size:12px; color:{GREEN_900}; font-weight:600;
       letter-spacing:.02em; }}
   .settle-hero .amt {{ font-size:40px; font-weight:700; color:{GREEN_1200};
@@ -1688,14 +1725,14 @@ st.markdown(f"""<style>
       font-variant-numeric:tabular-nums; background:#FFFFFF; }}
   table.sflow td {{ padding:9px 12px; }}
   table.sflow td.n {{ text-align:right; white-space:nowrap; }}
-  table.sflow tr.step td {{ border-bottom:1px solid #F0F0F2; }}
+  table.sflow tr.step td {{ border-bottom:1px solid {LINE_SOFT}; }}
   table.sflow tr.sum td {{ border-top:2px solid {GREEN_900}; font-weight:600; }}
   table.sflow tr.minus td {{ color:{SUBTLE}; }}
   table.sflow tr.final td {{ border-top:2px solid {GREEN_900}; font-weight:700;
       background:{GREEN_50}; font-size:15px; }}
   .sflow-idx {{ color:{GREEN_900}; font-weight:600; }}
-  .settle-land {{ background:#FFFFFF; border:1px dashed {GREEN_200};
-      border-radius:8px; padding:8px 12px; font-size:13px; margin:8px 0 2px; }}
+  .settle-land {{ background:#FFFFFF; border:1.5px dashed {GREEN_200};
+      border-radius:7px; padding:8px 12px; font-size:13px; margin:8px 0 2px; }}
   .settle-land b {{ color:{GREEN_900}; }}
 </style>""", unsafe_allow_html=True)
 

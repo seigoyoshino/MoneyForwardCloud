@@ -73,4 +73,16 @@ if [ "$fail" -ne 0 ]; then
 MSG
     exit 1
 fi
+
+# デザイントークン・共通CSSが Local 版とずれていないか。
+# チェック本体は非公開リポジトリ側にある（../MoneyForwardDashboard が無い
+# 環境——公開リポジトリ単体のクローン・外部の貢献者・CI——では黙って素通りする）
+SYNC_SCRIPT="../MoneyForwardDashboard/tools/check_theme_sync.py"
+if [ -f "$SYNC_SCRIPT" ] && command -v python >/dev/null 2>&1; then
+    if ! python "$SYNC_SCRIPT"; then
+        printf '%s✗ Local/Cloud のデザイントークンがずれています（上記参照）%s\n' "$RED" "$OFF"
+        printf '  両方そろえてから push してください。迂回: git push --no-verify\n'
+        exit 1
+    fi
+fi
 exit 0
