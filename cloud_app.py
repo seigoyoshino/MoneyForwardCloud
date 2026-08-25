@@ -2904,11 +2904,55 @@ if role:
                     var_amt = -exp.loc[~fixed_mask, "amount"].sum()
                     ratio = (fixed_amt / (fixed_amt + var_amt) * 100
                              if fixed_amt + var_amt > 0 else None)
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric(f"固定費（{period_label}）", fyen(fixed_amt))
-                    c2.metric("変動費", fyen(var_amt))
-                    c3.metric("固定費率", f"{ratio:.1f}%" if ratio is not None else "—")
+                    st.markdown(
+                        f'<div class="homecard tight">'
+                        f'<div class="hc-h">固定費・変動費（{period_label}）</div><table>'
+                        f'<tr><td class="k">固定費</td>'
+                        f'<td class="v">{fyen(fixed_amt)}</td></tr>'
+                        f'<tr><td class="k">変動費</td>'
+                        f'<td class="v">{fyen(var_amt)}</td></tr>'
+                        f'<tr><td class="k">固定費率</td>'
+                        f'<td class="v">{f"{ratio:.1f}%" if ratio is not None else "—"}</td></tr>'
+                        f'</table></div>', unsafe_allow_html=True)
                     st.caption(f"固定費の定義 — 大項目: {'・'.join(f_cats)} ／ 中項目: {'・'.join(f_subs)}")
+
+                    pv = scoped_all[scoped_all["amount"] < 0].copy()
+                    pv["kind"] = "変動費"
+                    pv.loc[is_fixed(pv, f_cats, f_subs), "kind"] = "固定費"
+                    pivot = (-pv.pivot_table(index="month", columns="kind", values="amount",
+                                             aggfunc="sum")).reindex(chart_months).fillna(0)
+                    fig = go.Figure()
+                    many = len(pivot) > 8
+                    for k_name, color, tcolor in [("固定費", GREEN_900, "#FFFFFF"),
+                                                  ("変動費", GRAY_200, INK)]:
+                        if k_name in pivot.columns:
+                            fig.add_bar(x=[m[2:].replace("-", "/") for m in pivot.index],
+                                        y=pivot[k_name], name=k_name, marker_color=color,
+                                        hovertemplate=HOVER_YEN,
+                                        text=None if IS_MOBILE else [man_label(v) for v in pivot[k_name]],
+                                        textposition="inside", insidetextanchor="middle",
+                                        textangle=-90 if many else 0,
+                                        textfont=dict(size=9, color=tcolor))
+                    fig.update_layout(barmode="stack")
+                    st.plotly_chart(base_layout(fig, height=300), width="stretch",
+                                    config=PLOTLY_CONFIG)
+
+                    # ---- 固定費率そのものの推移。上下しているかを見るためのもので、
+                    # 目標線・中央値線は引かない（固定比率に目標を置いていないため）----
+                    st.markdown("##### 固定費率の推移（直近12ヶ月）")
+                    pivot_all = (-pv.pivot_table(index="month", columns="kind", values="amount",
+                                                 aggfunc="sum")).reindex(all_months).fillna(0)
+                    tot = pivot_all.sum(axis=1)
+                    fixed_col = (pivot_all["固定費"] if "固定費" in pivot_all.columns
+                                else tot * 0)
+                    ratio_series = (fixed_col / tot * 100).where(tot > 0).tail(12)
+                    fig_ratio = go.Figure(go.Scatter(
+                        x=[m[2:].replace("-", "/") for m in ratio_series.index],
+                        y=ratio_series.values, mode="lines+markers", showlegend=False,
+                        line=dict(color=GREEN_600, width=2),
+                        hovertemplate="%{y:.1f}%<extra>%{x}</extra>"))
+                    st.plotly_chart(base_layout(fig_ratio, height=200), width="stretch",
+                                    config=PLOTLY_CONFIG)
 
                     # ---- 契約中のサブスク一覧（閲覧のみ） ----
                     # ⚠️ **契約マスタが正。実績側から推測して足さない。**
@@ -2937,27 +2981,6 @@ if role:
                     else:
                         st.caption("契約マスタがバンドルに入っていません。"
                                    "ローカルで update_cloud_data.bat を実行すると出ます。")
-
-                    pv = scoped_all[scoped_all["amount"] < 0].copy()
-                    pv["kind"] = "変動費"
-                    pv.loc[is_fixed(pv, f_cats, f_subs), "kind"] = "固定費"
-                    pivot = (-pv.pivot_table(index="month", columns="kind", values="amount",
-                                             aggfunc="sum")).reindex(chart_months).fillna(0)
-                    fig = go.Figure()
-                    many = len(pivot) > 8
-                    for k_name, color, tcolor in [("固定費", GREEN_900, "#FFFFFF"),
-                                                  ("変動費", GRAY_200, INK)]:
-                        if k_name in pivot.columns:
-                            fig.add_bar(x=[m[2:].replace("-", "/") for m in pivot.index],
-                                        y=pivot[k_name], name=k_name, marker_color=color,
-                                        hovertemplate=HOVER_YEN,
-                                        text=None if IS_MOBILE else [man_label(v) for v in pivot[k_name]],
-                                        textposition="inside", insidetextanchor="middle",
-                                        textangle=-90 if many else 0,
-                                        textfont=dict(size=9, color=tcolor))
-                    fig.update_layout(barmode="stack")
-                    st.plotly_chart(base_layout(fig, height=300), width="stretch",
-                                    config=PLOTLY_CONFIG)
 
                 # ---- 清算 ----
                 with tab_settle:
