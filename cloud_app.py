@@ -160,6 +160,19 @@ def html_table(df, height: int | None = None, **_ignored):
 PLOTLY_CONFIG = {"displayModeBar": False, "scrollZoom": False}
 
 
+def clickable_chart(fig: go.Figure, key: str):
+    """クリック選択つきでグラフを描画し、選択された点(list[dict])を返す。"""
+    try:
+        ev = st.plotly_chart(fig, width="stretch", key=key, config=PLOTLY_CONFIG,
+                             on_select="rerun", selection_mode="points")
+        sel = getattr(ev, "selection", None)
+        pts = getattr(sel, "points", None) if sel is not None else None
+        return list(pts) if pts else []
+    except Exception:
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
+        return []
+
+
 def base_layout(fig: go.Figure, height=320, hover="closest") -> go.Figure:
     """クラウド版の既定は hovermode="closest"。スマホでは "x unified" の
     まとめ表示が指に対して大きすぎて画面を覆うため、ローカル版と既定が違う。
@@ -1608,6 +1621,13 @@ st.markdown(f"""<style>
     margin-top: 9px; overflow: hidden; }}
   .totbar .tb-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
   .totbar .tb-bar.over i {{ background: {ERROR}; }}
+  /* 過去月を見ているときだけ出る「当月に戻る」。戻るボタンより控えめに */
+  .st-key-catback {{ margin: -6px 0 8px; }}
+  .st-key-catback button {{ min-height: 34px; justify-content: flex-start;
+    border: 1px dashed {LINE}; background: {PAPER}; color: {SUBTLE}; }}
+  .st-key-catback button > div {{ justify-content: flex-start; width: 100%; }}
+  .st-key-catback button p {{ font-size: 12px; text-align: left; }}
+  .st-key-catback button:hover {{ border-color: {GREEN_400}; color: {GREEN_900}; }}
   /* ---- パンくず。各段がボタン、現在地だけ素のテキスト ----
      ボタンと素のテキストが混ざるので、行の高さと余白を両方に同じ値で当てて
      ベースラインをそろえる（揃えないと区切り記号だけ沈む） */
@@ -2588,64 +2608,101 @@ if role:
                             # 第4階層 大項目の詳細
                             # ============================================================
                             def render_cat(cat: str):
+                                """第4階層。棒グラフの月をタップすると、その月の内訳と明細に切り替わる。
+
+                                どの月を見ているかを常に見出しに出す。当月を見ているときは
+                                「当月に戻る」を出さない（平常時に文字を増やさないため）。
+                                """
                                 row = next((x for x in crows if x["cat"] == cat), None)
                                 if row is None:
                                     nav_go(NAV_VAR)
                                     return
-                                nav_header(NAV_CAT, cat, title=cat)
-
-                                b, a = row["budget"], row["actual"]
-                                sub = f"（予算 {fyen(b)}" if b > 0 else "（予算未設定"
-                                if b > 0:
-                                    sub += ("　残り " + fyen(row["left"]) if row["left"] >= 0
-                                            else "　" + fyen(-row["left"]) + " 超過")
-                                st.markdown(
-                                    f'<div class="totbar">'
-                                    f'<div class="tb-line"><span>{month_label(pace_month)}合計'
-                                    f'（{cur_day}日時点）</span>'
-                                    f'<span><b style="color:{ERROR if row["over"] else INK}">'
-                                    f'{fyen(a)}</b></span></div>'
-                                    f'<div class="tb-line"><span>{sub}）</span><span></span></div>'
-                                    f'<div class="tb-bar{" over" if row["over"] else ""}">'
-                                    f'<i style="width:{min(100, row["pct"] or 0):.0f}%"></i></div></div>',
-                                    unsafe_allow_html=True)
 
                                 have_m = set(pdf["month"])
                                 ms2 = [m for m in prev_months(pace_month, 12) if m in have_m] \
                                     + [pace_month]
-                                det = category_detail(pdf, cat, pace_month, cur_day, ms2)
-                                xs = [month_label(m) for m in ms2]
-                                ys = [det["series"][m] for m in ms2]
+                                picked = st.session_state.setdefault("cat_month", {})
+                                sel_m = picked.get(cat, pace_month)
+                                if sel_m not in ms2:          # 対象月を切り替えたら選択を捨てる
+                                    sel_m = pace_month
+                                is_cur = sel_m == pace_month
+                                # 過去月は月末まで確定している。当月だけ as-of で切る
+                                sel_day = cur_day if is_cur else days_in_month(sel_m)
 
+                                nav_header(NAV_CAT, cat, title=f"{cat}（{month_label(sel_m)}）")
+                                if not is_cur:
+                                    with st.container(key="catback"):
+                                        if st.button(f"↩　{month_label(pace_month)}（当月）に戻る",
+                                                     key="w_cat_cur", use_container_width=True):
+                                            picked.pop(cat, None)
+                                            st.rerun()
+
+                                # ---- 見出しの数字。予算と残りは当月にしか意味がない ----
+                                b_, a_ = row["budget"], row["actual"]
+                                chart = category_detail(pdf, cat, pace_month, cur_day, ms2)
+                                if is_cur:
+                                    sub = f"（予算 {fyen(b_)}" if b_ > 0 else "（予算未設定"
+                                    if b_ > 0:
+                                        sub += ("　残り " + fyen(row["left"]) if row["left"] >= 0
+                                                else "　" + fyen(-row["left"]) + " 超過")
+                                    sub += "）"
+                                    head_amt, head_over, head_pct = a_, row["over"], row["pct"] or 0
+                                    head_note = f"{month_label(sel_m)}合計（{cur_day}日時点）"
+                                else:
+                                    head_amt = chart["series"].get(sel_m, 0.0)
+                                    head_over, head_pct = False, 0
+                                    sub = "（過ぎた月なので予算との比較は出しません）"
+                                    head_note = f"{month_label(sel_m)}合計"
+                                st.markdown(
+                                    f'<div class="totbar">'
+                                    f'<div class="tb-line"><span>{head_note}</span>'
+                                    f'<span><b style="color:{ERROR if head_over else INK}">'
+                                    f'{fyen(head_amt)}</b></span></div>'
+                                    f'<div class="tb-line"><span>{sub}</span><span></span></div>'
+                                    + (f'<div class="tb-bar{" over" if head_over else ""}">'
+                                       f'<i style="width:{min(100, head_pct):.0f}%"></i></div>'
+                                       if is_cur and b_ > 0 else "")
+                                    + '</div>', unsafe_allow_html=True)
+
+                                # ---- 推移。選んだ月の棒だけ色を変える ----
+                                xs = [month_label(m) for m in ms2]
                                 fig2 = go.Figure()
                                 fig2.add_trace(go.Bar(
-                                    x=xs, y=ys, name="実績",
-                                    marker_color=[GREEN_600 if m == pace_month else GRAY_200
+                                    x=xs, y=[chart["series"][m] for m in ms2], name="実績",
+                                    marker_color=[GREEN_600 if m == sel_m else GRAY_200
                                                   for m in ms2],
-                                    hovertemplate="%{y:,.0f}円<extra>実績</extra>"))
-                                if b > 0:
+                                    hovertemplate="%{y:,.0f}円<extra>%{x}</extra>"))
+                                if b_ > 0:
                                     fig2.add_hline(
-                                        y=b, line=dict(color=SUBTLE, width=1, dash="dot"),
-                                        annotation_text=f"予算 {fyen(b)}",
+                                        y=b_, line=dict(color=SUBTLE, width=1, dash="dot"),
+                                        annotation_text=f"予算 {fyen(b_)}",
                                         annotation_position="top left",
                                         annotation_font=dict(size=11, color=SUBTLE))
-                                base_layout(fig2, height=260, hover="x")
-                                st.plotly_chart(fig2, width="stretch", key="pace_cat_trend",
-                                                config=PLOTLY_CONFIG)
+                                base_layout(fig2, height=260, hover="closest")
+                                pts = clickable_chart(fig2, "pace_cat_trend")
+                                if pts:
+                                    lbl = pts[0].get("x")
+                                    hit = next((m for m in ms2 if month_label(m) == lbl), None)
+                                    if hit and hit != sel_m:
+                                        picked[cat] = hit
+                                        st.rerun()
                                 st.caption(
-                                    ("各月とも月末までの実額。" if cur_day >= dim else
-                                     f"過去の月は月末までの実額、{month_label(pace_month)}だけ"
-                                     f"{cur_day}日時点までです（棒が短いのはそのぶん）。"))
+                                    "棒をタップするとその月の内訳に切り替わります。",
+                                    help=("各月とも月末までの実額です。" if cur_day >= dim else
+                                          f"過去の月は月末までの実額、{month_label(pace_month)}だけ"
+                                          f"{cur_day}日時点までです（棒が短いのはそのぶん）。"))
 
                                 # ---- 中項目の内訳。各行を開くとその中項目の明細が出る ----
-                                st.markdown(f"##### 中項目の内訳（{cur_day}日時点）")
+                                det = category_detail(pdf, cat, sel_m, sel_day, [sel_m])
+                                st.markdown(f"##### 中項目の内訳"
+                                            + (f"（{sel_day}日時点）" if is_cur else ""))
                                 if not det["subs"]:
-                                    st.caption("この大項目は当月まだ支出がありません。")
+                                    st.caption("この月の支出はありません。")
                                     return
 
                                 neg = pdf[(pdf["amount"] < 0) & (pdf["cat"] == cat)
-                                          & (pdf["month"] == pace_month)
-                                          & (pdf["day"] <= cur_day)]
+                                          & (pdf["month"] == sel_m)
+                                          & (pdf["day"] <= sel_day)]
                                 neg = neg[~is_fixed(neg)]
                                 sub_tot = sum(x["amount"] for x in det["subs"])
                                 for x in det["subs"]:
@@ -2662,9 +2719,9 @@ if role:
                                         html_table(pd.DataFrame([
                                             {"日付": pd.Timestamp(t.date).strftime("%m/%d"),
                                              "内容": (str(t.content)
-                                                      + ("　※実際の明細ではありません" if s else "")),
+                                                      + ("　※実際の明細ではありません" if sy else "")),
                                              "金額": fyen(-t.amount)}
-                                            for t, s in zip(d.itertuples(), syn)]))
+                                            for t, sy in zip(d.itertuples(), syn)]))
 
                             # ---- ルーティング ----
                             view, nav_cat = nav_now()
@@ -2762,6 +2819,28 @@ if role:
                         series = (-scoped_all[(scoped_all["amount"] < 0)
                                               & (scoped_all["cat"] == sel_cat)]
                                   .groupby("month")["amount"].sum()).reindex(chart_months).fillna(0)
+
+                        # 月次推移の棒をタップすると、下の中項目内訳と明細がその月に切り替わる。
+                        # ⚠️ Cloud版は中項目の絞り込みがプルダウン選択という別レイアウトのため、
+                        # Local版の col_l/col_r クリック連動はそのまま移植できない。ここでは
+                        # 既存レイアウトを保ったまま「月をタップすると集計対象がその月に絞られる」
+                        # 挙動だけを足す（レイアウトの作り直しは pace_todo.md の別タスク）
+                        cm = st.session_state.setdefault("cat_tab_month", {})
+                        pick_m = cm.get(sel_cat)
+                        if pick_m and pick_m not in set(series.index):
+                            pick_m, _ = None, cm.pop(sel_cat, None)
+                        scope_label = month_label(pick_m) if pick_m else period_label
+                        if pick_m:
+                            exp_v = scoped_all[(scoped_all["amount"] < 0)
+                                               & (scoped_all["month"] == pick_m)]
+                            with st.container(key="catback"):
+                                if st.button(f"↩　{period_label}に戻る", key="w_cattab_cur",
+                                             use_container_width=True):
+                                    cm.pop(sel_cat, None)
+                                    st.rerun()
+                        else:
+                            exp_v = exp
+
                         many = len(series) > 8
                         fig = go.Figure(go.Bar(
                             x=[m[2:].replace("-", "/") for m in series.index], y=series.values,
@@ -2774,10 +2853,18 @@ if role:
                                       annotation_font_size=11)
                         if series.max() > 0:
                             fig.update_yaxes(range=[0, float(series.max()) * 1.25])
-                        st.plotly_chart(base_layout(fig, height=260), width="stretch",
-                                        config=PLOTLY_CONFIG)
+                        mpts = clickable_chart(base_layout(fig, height=260, hover="closest"),
+                                               "cattab_month_chart")
+                        if mpts:
+                            lbl = str(mpts[0].get("x", ""))
+                            hit = next((m for m in series.index
+                                        if m[2:].replace("-", "/") == lbl), None)
+                            if hit and hit != pick_m:
+                                cm[sel_cat] = hit
+                                st.rerun()
+                        st.caption("棒をタップするとその月に絞り込みます。")
 
-                        sub_sum = (-exp[exp["cat"] == sel_cat].groupby("sub")["amount"].sum()
+                        sub_sum = (-exp_v[exp_v["cat"] == sel_cat].groupby("sub")["amount"].sum()
                                    ).sort_values()
                         sub_total = sub_sum.sum()
                         fig = go.Figure(go.Bar(
@@ -2796,11 +2883,11 @@ if role:
                         pick = st.selectbox("明細を中項目で絞り込み",
                                             ["すべて"] + sub_sum.sort_values(ascending=False)
                                             .index.tolist())
-                        pool = exp[exp["cat"] == sel_cat]
+                        pool = exp_v[exp_v["cat"] == sel_cat]
                         if pick != "すべて":
                             pool = pool[pool["sub"] == pick]
                         big = pool.nsmallest(30, "amount")
-                        st.caption("金額の大きい明細（上位30件）")
+                        st.caption(f"金額の大きい明細（{scope_label}・上位30件）")
                         html_table(pd.DataFrame({
                             "日付": big["date"].str[5:], "内容": big["content"],
                             "中項目": big["sub"],
