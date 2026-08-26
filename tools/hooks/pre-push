@@ -55,8 +55,13 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
         check "追加行"           "$added" "$n"    "実名（$n）"
         check "コミットメッセージ" "$msgs"  "$n"    "実名（$n）"
     done
-    check "追加行"           "$added" "$MONEY" "金額らしき数字"
-    check "コミットメッセージ" "$msgs"  "$MONEY" "金額らしき数字"
+    # rgba(255,255,255,.75) のようなCSS色関数は「3桁,3桁」の並びになり、
+    # 3桁区切りの金額と区別がつかず誤検出する（2026-08-26に実際に発生）。
+    # 金額チェックだけこの行を除外する。名前チェックは対象を絞らない
+    # （色指定に実名が混ざる想定はないため、除外しなくても実害がない）
+    added_for_money=$(printf '%s\n' "$added" | grep -vE 'rgba?\(|hsla?\(' || true)
+    check "追加行"           "$added_for_money" "$MONEY" "金額らしき数字"
+    check "コミットメッセージ" "$msgs"             "$MONEY" "金額らしき数字"
 done
 
 if [ "$fail" -ne 0 ]; then
