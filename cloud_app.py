@@ -2348,7 +2348,10 @@ if role:
                                         f"※ 今月は賞与など不定期の入金 "
                                         f"{fyen(r['irregular_income'])} があります"
                                         "　:grey[ⓘ]", help="上限には含めていません")
-                                if bl_start and len(hist_months) < BASELINE_WINDOW:
+                                # 起点直後ほど誤差が大きいので、そこだけ警告する。
+                                # window(6ヶ月)がそろうまでずっと出すと「常時表示」になってしまう
+                                # （起点を切り替えた月から5ヶ月間、毎回出ていた）
+                                if bl_start and len(hist_months) < BASELINE_WINDOW // 2:
                                     st.warning(
                                         f"生活水準が変わった {month_label(bl_start)} を起点にしているため、"
                                         f"基準線は **{len(hist_months)}ヶ月ぶん**"
@@ -2843,7 +2846,11 @@ if role:
                             textfont=dict(size=10, color=INK),
                             hovertemplate="%{y}: %{x:,.0f}円<extra></extra>"))
                         fig.update_xaxes(range=[0, float(vals.max()) * 1.5])
-                        st.plotly_chart(base_layout(fig, height=max(300, 26 * len(vals) + 80)),
+                        # 横棒はy軸がカテゴリ名なので、既定のグリッド線を出すと
+                        # 行ごとに横線が入り、外側の数値ラベルを貫いて読みにくくなる
+                        base_layout(fig, height=max(300, 26 * len(vals) + 80)) \
+                            .update_yaxes(showgrid=False)
+                        st.plotly_chart(fig,
                                         width="stretch", config=PLOTLY_CONFIG)
                         st.caption(f"合計 {fyen(total)}")
 
@@ -2925,9 +2932,9 @@ if role:
                             hovertemplate="%{y}: %{x:,.0f}円<extra></extra>"))
                         if len(sub_sum) and sub_sum.max() > 0:
                             fig.update_xaxes(range=[0, float(sub_sum.max()) * 1.5])
-                        st.plotly_chart(
-                            base_layout(fig, height=max(200, 34 * len(sub_sum) + 60)),
-                            width="stretch", config=PLOTLY_CONFIG)
+                        base_layout(fig, height=max(200, 34 * len(sub_sum) + 60)) \
+                            .update_yaxes(showgrid=False)
+                        st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
 
                         pick = st.selectbox("明細を中項目で絞り込み",
                                             ["すべて"] + sub_sum.sort_values(ascending=False)
