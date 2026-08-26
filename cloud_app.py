@@ -2183,12 +2183,13 @@ if role:
                                 # バーの3分割（支出／今後の固定費／残り）と語をそろえる
                                 body = (f"支出 {fyen(r['spent'])}　＋今後 {fyen(r['upcoming'])}　　"
                                         + (f"残り **{fyen(r['remain'])}**" if not over
-                                           else f":red[**{fyen(-r['remain'])} 超過**]"))
+                                           else f':color[**{fyen(-r["remain"])} 超過**]'
+                                                f'{{foreground="{ERROR}"}}'))
                                 # 第2階層の結果予想と同じ判定を使う（別々に書くとずれる）
                                 h_icon, h_kind, _ = forecast_state()
                                 if h_kind == "over":
-                                    tail = (f"\n\n{h_icon} :red[このままだと予算を "
-                                            f"{fyen(landing_over)} 超えそう]")
+                                    tail = (f'\n\n{h_icon} :color[このままだと予算を '
+                                            f'{fyen(landing_over)} 超えそう]{{foreground="{ERROR}"}}')
                                 elif h_kind == "under":
                                     tail = f"\n\n{h_icon} このままなら {fyen(-landing_over)} 余りそう"
                                 elif h_kind == "edge":
@@ -2247,16 +2248,14 @@ if role:
                                 if kind == "over":
                                     msg = (f'予算を <b style="color:{ERROR}">'
                                            f'{fyen(landing_over)}</b> 超えちゃいそう。')
-                                    note = "最後まであきらめないで。"
+                                    note = ""
                                 elif kind == "under":
                                     msg = (f'このままなら <b style="color:{GOOD}">'
                                            f'{fyen(-landing_over)}</b> 余りそう。')
                                     note = ""
                                 elif kind == "edge":
                                     msg = ('<b>ぎりぎり予算どおり</b>に着地しそう。')
-                                    note = (f"上限との差は {fyen(abs(landing_over))}。"
-                                            f"1日あたり{FORECAST_BAND_DAYS}日ぶんの調整で"
-                                            "どちらにも転びます。")
+                                    note = f"上限との差は {fyen(abs(landing_over))}"
                                 if kind:
                                     cls = {"over": " warn", "edge": " edge"}.get(kind, "")
                                     st.markdown(
@@ -2332,7 +2331,8 @@ if role:
                                            f"支出 {fyen(var_paid)}　　")
                                 v_left = var_budget - var_paid
                                 v_label += (f"残り **{fyen(v_left)}**" if v_left >= 0
-                                            else f":red[**{fyen(-v_left)} 超過**]")
+                                            else f':color[**{fyen(-v_left)} 超過**]'
+                                                 f'{{foreground="{ERROR}"}}')
                                 if nav_row("var", v_label, var_pct, over=v_left < 0):
                                     nav_go(NAV_VAR)
 
@@ -2530,7 +2530,8 @@ if role:
                                         body = f"支出 {fyen(a)}"
                                     else:
                                         head += ("　　" + (f"残り **{fyen(left)}**" if left >= 0
-                                                          else f":red[**{fyen(-left)} 超過**]"))
+                                                          else f':color[**{fyen(-left)} 超過**]'
+                                                               f'{{foreground="{ERROR}"}}'))
                                         body = (f"支出 {fyen(a)}　　予算 {fyen(b)}"
                                                 + (f"　　1日 {fyen(x['per_day'])}" if ongoing else "")
                                                 + (f"　　{x['pct']:.0f}%" if x["pct"] is not None else ""))
@@ -2606,13 +2607,6 @@ if role:
                                     f'<div class="fc-msg">差引がマイナスの月が '
                                     f'<b style="color:{ERROR}">{x["neg_months"]}/{n}ヶ月</b>'
                                     f'</div>'
-                                    f'<div class="fc-note">'
-                                    f'特別な支出は{x["exp_months"]}/{n}ヶ月で発生（月あたり '
-                                    f'{fyen(x["exp_avg"])}）、'
-                                    f'臨時収入は{x["inc_months"]}/{n}ヶ月のみ（計 '
-                                    f'{fyen(x["inc_total"])}）。'
-                                    f'ほとんどの月は特別な支出ぶんだけマイナスで、たまに入る'
-                                    f'大きな臨時収入がそれを埋める構造です。</div>'
                                     f'</div></div>', unsafe_allow_html=True)
 
                                 fig = go.Figure()
