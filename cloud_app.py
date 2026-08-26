@@ -47,6 +47,13 @@ OVER_BG = "#F4E1DC"                          # 超過・赤字の背景（文字
 PENDING, PENDING_BG = "#93590C", "#F1E2C4"  # 速報・未確定（オーカー。金とは別トーン）
 INDIGO = GREEN_900     # 収入・黒字（Primary Green 900）
 SHU = GRAY_600         # 支出（Negative = SolidGray 600）
+# ---------- ブランド・金（段階4）。深緑を「額縁」（ヘッダー帯・サイドバー・
+# 選択タブ下線）に使い、意味色（GOOD/ERROR等）とは独立させる。金は罫線・
+# アイコンのアクセントだけに使い、数字・本文には使わない ----------
+BRAND_DEEP = "#14432E"   # 深緑・額縁。ヘッダー帯・サイドバー背景
+BRAND = "#1F6B4A"        # 深緑・中間。リンク・ホバー・階層ナビの矢印・チャートの強調色
+GOLD = "#9C7A3F"         # 金。罫線・アイコンのアクセント
+GOLD_BRIGHT = "#B8923F"  # 金（濃色背景用）。BRAND_DEEPの背景の上で使う
 # ==== SHARED THEME TOKENS END ====
 
 CAT_COLORS = {
@@ -98,6 +105,17 @@ def month_label(m: str) -> str:
 
 
 HOVER_YEN = "%{y:,.0f}円<extra>%{fullData.name}</extra>"
+
+def header_band(title: str, caption: str = "") -> str:
+    """ページ最上部の帯（額縁）。深緑背景に金の下罫線を敷く。
+
+    st.title() の素の見出しだと帯にできない（Streamlitのコンテナ余白を
+    はみ出せない）ので、自前HTMLのカードとして描く。
+    """
+    cap = f'<div class="ah-caption">{caption}</div>' if caption else ""
+    return (f'<div class="app-header"><div class="ah-title">🧾 {title}</div>'
+            f'{cap}</div>')
+
 
 def kpi_card(k: dict, label: str) -> str:
     """収入・支出・収支の実績カード（HTML）。
@@ -1576,7 +1594,7 @@ st.markdown(f"""<style>
   /* ---- 階層ナビゲーション ---- */
   /* 戻るボタン。スマホの親指で押すので高さ44pxを確保する（狭いリンクにしない） */
   .st-key-navback button {{ min-height: 44px; justify-content: flex-start;
-    border: none; background: transparent; color: {GREEN_900}; padding-left: 0; }}
+    border: none; background: transparent; color: {BRAND}; padding-left: 0; }}
   /* ラベルは navrow と同じくflexで中央に寄るので、左に戻す */
   .st-key-navback button > div {{ justify-content: flex-start; width: 100%; }}
   .st-key-navback button p {{ font-size: 14px; font-weight: 600;
@@ -1590,12 +1608,12 @@ st.markdown(f"""<style>
     padding: 12px 30px 16px 16px; text-align: left; justify-content: flex-start;
     align-items: flex-start; border: 1.5px solid {LINE}; border-radius: 7px;
     background: #FFFFFF; overflow: hidden; }}
-  div[class*="st-key-navrow-"] button:hover {{ border-color: {GREEN_400};
+  div[class*="st-key-navrow-"] button:hover {{ border-color: {BRAND};
     background: {GREEN_50}; }}
   /* 右端の › は擬似要素で足す（ラベルに入れると折り返しで位置がぶれる） */
   div[class*="st-key-navrow-"] button::before {{ content: "›";
     position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
-    font-size: 20px; color: {GRAY_400}; }}
+    font-size: 20px; color: {BRAND}; }}
   /* 進捗バー。幅と色は行ごとに1本だけルールを生成して当てる */
   div[class*="st-key-navrow-"] button::after {{ content: "";
     position: absolute; left: 0; bottom: 0; height: 5px; width: 0;
@@ -1667,7 +1685,7 @@ st.markdown(f"""<style>
     border: 1px dashed {LINE}; background: {PAPER}; color: {SUBTLE}; }}
   .st-key-catback button > div {{ justify-content: flex-start; width: 100%; }}
   .st-key-catback button p {{ font-size: 12px; text-align: left; }}
-  .st-key-catback button:hover {{ border-color: {GREEN_400}; color: {GREEN_900}; }}
+  .st-key-catback button:hover {{ border-color: {BRAND}; color: {BRAND}; }}
   /* ---- パンくず。各段がボタン、現在地だけ素のテキスト ----
      ボタンと素のテキストが混ざるので、行の高さと余白を両方に同じ値で当てて
      ベースラインをそろえる（揃えないと区切り記号だけ沈む） */
@@ -1681,7 +1699,7 @@ st.markdown(f"""<style>
     display: flex; align-items: center; height: 24px; margin: 0; }}
   .st-key-navcrumb button {{ min-height: 24px; height: 24px; padding: 0 7px;
     color: {SUBTLE}; border: none; background: transparent; }}
-  .st-key-navcrumb button:hover {{ color: {GREEN_900}; background: {GREEN_50}; }}
+  .st-key-navcrumb button:hover {{ color: {BRAND}; background: {GREEN_50}; }}
   .st-key-navcrumb p {{ font-size: 12px; line-height: 24px; margin: 0;
     color: {SUBTLE}; white-space: nowrap; }}
   /* stMarkdown の内側に高さ10pxの中間divがあり、そこで沈む（実測）。
@@ -1717,6 +1735,25 @@ st.markdown(f"""<style>
   div[data-testid="stMetric"] {{
     background: #FFFFFF; border: 1.5px solid {LINE}; border-radius: 7px; padding: 12px 16px;
   }}
+  /* ---- ヘッダー帯（額縁）。深緑背景＋金の下罫線 ---- */
+  .app-header {{ background: {BRAND_DEEP}; color: #FFFFFF; border-radius: 7px;
+    padding: 18px 22px; margin: 0 0 16px; border-bottom: 3px solid {GOLD_BRIGHT}; }}
+  .app-header .ah-title {{ font-size: 26px; font-weight: 600; letter-spacing: .03em;
+    line-height: 1.3; }}
+  .app-header .ah-caption {{ font-size: 13px; color: rgba(255,255,255,.75);
+    margin-top: 4px; }}
+  /* ---- サイドバー（額縁）。深緑背景。既定の暗い文字色を明るく上書きする ---- */
+  [data-testid="stSidebar"] {{ background: {BRAND_DEEP}; }}
+  [data-testid="stSidebar"] h1 {{ color: #FFFFFF; }}
+  [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
+    color: rgba(255,255,255,.7); }}
+  [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFFFF; }}
+  [data-testid="stSidebar"] [data-testid="stTooltipIcon"] svg {{
+    stroke: rgba(255,255,255,.55) !important; }}
+  [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {{ color: #FFFFFF; }}
+  [data-testid="stSidebar"] [data-baseweb="radio"] label,
+  [data-testid="stSidebar"] [data-baseweb="checkbox"] label {{ color: #FFFFFF; }}
+  [data-testid="stSidebar"] hr {{ border-color: {GOLD_BRIGHT}; opacity: .6; }}
   /* ==== SHARED THEME CSS END ==== */
   /* 清算ビューの結論カード。st.metric では値の文字サイズを変えられないため自前で描く */
   .settle-hero {{ background:{GREEN_50}; border:1.5px solid {GREEN_900};
@@ -1775,7 +1812,7 @@ def auth_configured() -> bool:
 role = None
 if auth_configured():
     if not st.user.is_logged_in:
-        st.title("🧾 家計ダッシュボード")
+        st.markdown(header_band("家計ダッシュボード"), unsafe_allow_html=True)
         st.write("このアプリは非公開です。登録済みのGoogleアカウントでログインしてください。")
         st.button("Googleでログイン", on_click=st.login, type="primary")
         st.stop()
@@ -1864,7 +1901,7 @@ if role:
 
             # ================= 清算のみ =================
             if role == "settle":
-                st.title("生活費の清算")
+                st.markdown(header_band("生活費の清算"), unsafe_allow_html=True)
                 if months:
                     render_settlement(master, months, settle)
                 else:
@@ -1872,7 +1909,7 @@ if role:
 
             # ================= フル表示 =================
             else:
-                st.title("家計ダッシュボード")
+                st.markdown(header_band("家計ダッシュボード"), unsafe_allow_html=True)
                 # スマホではサイドバーが既定で折りたたまれるため、切替頻度の高い期間の
                 # 選択は本文に置く（清算ビューの「清算対象月」と同じ扱い）。
                 pc1, pc2 = st.columns([1, 1])
@@ -2575,7 +2612,7 @@ if role:
                                 fig.add_trace(go.Scatter(
                                     x=list(range(1, dim + 1)), y=cur_cum, mode="lines",
                                     name=month_label(pace_month),
-                                    line=dict(color=GREEN_900, width=3),
+                                    line=dict(color=BRAND, width=3),
                                     hovertemplate="%{y:,.0f}円<extra>"
                                                   + month_label(pace_month) + "</extra>"))
                                 fig.add_vline(x=cur_day, line=dict(color=SUBTLE, width=1, dash="dot"))
@@ -2719,7 +2756,7 @@ if role:
                                 fig2 = go.Figure()
                                 fig2.add_trace(go.Bar(
                                     x=xs, y=[chart["series"][m] for m in ms2], name="実績",
-                                    marker_color=[GREEN_900 if m == sel_m else GRAY_200
+                                    marker_color=[BRAND if m == sel_m else GRAY_200
                                                   for m in ms2],
                                     hovertemplate="%{y:,.0f}円<extra>%{x}</extra>"))
                                 if b_ > 0:
@@ -2900,7 +2937,7 @@ if role:
                         many = len(series) > 8
                         fig = go.Figure(go.Bar(
                             x=[m[2:].replace("-", "/") for m in series.index], y=series.values,
-                            marker_color=GREEN_900, hovertemplate=HOVER_YEN, name=sel_cat,
+                            marker_color=BRAND, hovertemplate=HOVER_YEN, name=sel_cat,
                             text=None if IS_MOBILE else [man_label(v) for v in series.values],
                             textposition="outside", textangle=-90 if many else 0,
                             textfont=dict(size=9, color=SUBTLE), cliponaxis=False))
@@ -2925,7 +2962,7 @@ if role:
                         sub_total = sub_sum.sum()
                         fig = go.Figure(go.Bar(
                             x=sub_sum.values, y=sub_sum.index, orientation="h",
-                            marker_color=GREEN_900,
+                            marker_color=BRAND,
                             text=[f"{fyen(v)}（{v / sub_total * 100:.1f}%）" for v in sub_sum.values],
                             textposition="outside", cliponaxis=False,
                             textfont=dict(size=10, color=INK),
@@ -2979,7 +3016,7 @@ if role:
                                              aggfunc="sum")).reindex(chart_months).fillna(0)
                     fig = go.Figure()
                     many = len(pivot) > 8
-                    for k_name, color, tcolor in [("固定費", GREEN_900, "#FFFFFF"),
+                    for k_name, color, tcolor in [("固定費", BRAND, "#FFFFFF"),
                                                   ("変動費", GRAY_200, INK)]:
                         if k_name in pivot.columns:
                             fig.add_bar(x=[m[2:].replace("-", "/") for m in pivot.index],
@@ -3005,7 +3042,7 @@ if role:
                     fig_ratio = go.Figure(go.Scatter(
                         x=[m[2:].replace("-", "/") for m in ratio_series.index],
                         y=ratio_series.values, mode="lines+markers", showlegend=False,
-                        line=dict(color=GREEN_900, width=2),
+                        line=dict(color=BRAND, width=2),
                         hovertemplate="%{y:.1f}%<extra>%{x}</extra>"))
                     st.plotly_chart(base_layout(fig_ratio, height=200), width="stretch",
                                     config=PLOTLY_CONFIG)
