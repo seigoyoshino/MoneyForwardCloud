@@ -38,7 +38,13 @@ GREEN_1200, GREEN_900, GREEN_600 = "#032213", "#115A36", "#259D63"
 GREEN_400, GREEN_200, GREEN_50 = "#51B883", "#9BD4B5", "#E6F5EC"
 CYAN_800, CYAN_600, CYAN_400 = "#006F83", "#00A3BF", "#2BC8E4"
 GRAY_800, GRAY_600, GRAY_400, GRAY_200 = "#333333", "#666666", "#999999", "#CCCCCC"
-SUCCESS, ERROR = "#197A4B", "#CE0000"
+SUCCESS, ERROR = "#197A4B", "#A3392A"
+# ---------- 意味色（段階2）。GREEN系（ブランド）とは別の色相を使い、
+# 装飾と衝突しないようにする。数字の状態（良好/超過/未確定）はここだけを使う ----------
+GOOD, GOOD_BG = "#0E6E6A", "#DFEFEC"        # 予算内・黒字・on track（ティール）
+GOOD_LIGHT = "#B7DEDA"                       # バーの「予定」部分・枠線など中間トーン
+OVER_BG = "#F4E1DC"                          # 超過・赤字の背景（文字色は ERROR を流用）
+PENDING, PENDING_BG = "#93590C", "#F1E2C4"  # 速報・未確定（オーカー。金とは別トーン）
 INDIGO = GREEN_900     # 収入・黒字（Primary Green 900）
 SHU = GRAY_600         # 支出（Negative = SolidGray 600）
 # ==== SHARED THEME TOKENS END ====
@@ -103,7 +109,7 @@ def kpi_card(k: dict, label: str) -> str:
             f'<div class="hc-ttl">家計簿<span>{label}</span></div>'
             f'<table>'
             f'<tr><td class="k">収入</td>'
-            f'<td class="v" style="color:{GREEN_900}">{fyen(k["income"])}</td></tr>'
+            f'<td class="v">{fyen(k["income"])}</td></tr>'
             f'<tr><td class="k">支出</td>'
             f'<td class="v" style="color:{SHU}">−{fyen(k["expense"])}</td></tr>'
             f'<tr><td class="k">収支</td>'
@@ -1063,8 +1069,8 @@ def bar_gradient(paid_pct: float | None, planned_pct: float | None = None,
     """
     p1 = min(100.0, max(0.0, paid_pct or 0.0))
     p2 = min(100.0, max(p1, planned_pct if planned_pct is not None else p1))
-    dark = ERROR if over else GREEN_600
-    light = "#F3B0B0" if over else GREEN_200
+    dark = ERROR if over else GOOD
+    light = "#F3B0B0" if over else GOOD_LIGHT
     return (f"linear-gradient(to right, {dark} 0 {p1:.1f}%, "
             f"{light} {p1:.1f}% {p2:.1f}%, {LINE} {p2:.1f}% 100%)")
 
@@ -1523,7 +1529,7 @@ st.markdown(f"""<style>
     font-variant-numeric: tabular-nums; margin-top: 2px; color: {SUBTLE}; }}
   .pace-hero .ph-tag {{ display: inline-block; font-size: 10px; font-weight: 600;
     padding: 0 5px; margin-left: 6px; border-radius: 3px; vertical-align: 2px;
-    background: #FFF4E5; color: #A45B00; }}
+    background: {PENDING_BG}; color: {PENDING}; }}
   @media (max-width: 640px) {{
     .pace-hero {{ grid-template-columns: 1fr; }}
     .pace-hero .ph-big {{ font-size: 30px; }}
@@ -1539,7 +1545,7 @@ st.markdown(f"""<style>
     font-variant-numeric: tabular-nums; line-height: 1.25; }}
   .fixrow .fx-bar {{ height: 7px; border-radius: 4px; background: {LINE};
     margin: 9px 0 6px; overflow: hidden; }}
-  .fixrow .fx-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .fixrow .fx-bar i {{ display: block; height: 100%; background: {GOOD}; }}
   .fixrow .fx-sub {{ color: {SUBTLE}; font-size: 12px;
     font-variant-numeric: tabular-nums; }}
   /* 変動費の費目別進捗（スマホ想定の2行構成） */
@@ -1564,7 +1570,7 @@ st.markdown(f"""<style>
      （超過行を上へ動かすと月内で位置が変わり、目で覚えられなくなる） */
   .vprog .vp-bar {{ height: 6px; border-radius: 3px; background: {LINE};
     margin: 6px 0 5px; overflow: hidden; }}
-  .vprog .vp-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .vprog .vp-bar i {{ display: block; height: 100%; background: {GOOD}; }}
   .vprog .vp-bar.over i {{ background: {ERROR}; }}
   .vprog .vp.total {{ background: {PAPER}; }}
   /* ---- 階層ナビゲーション ---- */
@@ -1593,7 +1599,7 @@ st.markdown(f"""<style>
   /* 進捗バー。幅と色は行ごとに1本だけルールを生成して当てる */
   div[class*="st-key-navrow-"] button::after {{ content: "";
     position: absolute; left: 0; bottom: 0; height: 5px; width: 0;
-    background: {GREEN_600}; }}
+    background: {GOOD}; }}
   /* Streamlit はボタンのラベルを flex で中央に寄せる。text-align だけでは
      効かない（段落が縮んで中央に置かれる）ので、縦積み・左揃えに変える */
   div[class*="st-key-navrow-"] button > div {{
@@ -1653,7 +1659,7 @@ st.markdown(f"""<style>
     margin-left: 6px; }}
   .totbar .tb-bar {{ height: 9px; border-radius: 5px; background: {LINE};
     margin-top: 9px; overflow: hidden; }}
-  .totbar .tb-bar i {{ display: block; height: 100%; background: {GREEN_600}; }}
+  .totbar .tb-bar i {{ display: block; height: 100%; background: {GOOD}; }}
   .totbar .tb-bar.over i {{ background: {ERROR}; }}
   /* 過去月を見ているときだけ出る「当月に戻る」。戻るボタンより控えめに */
   .st-key-catback {{ margin: -6px 0 8px; }}
@@ -1691,10 +1697,10 @@ st.markdown(f"""<style>
   .st-key-navcrumb .crumb-sep {{ font-family: "Segoe UI", system-ui, sans-serif;
     font-size: 15px; color: {GRAY_400}; }}
   /* ---- 結果予想。第2階層でいちばん目立つ要素にする ---- */
-  .forecast {{ border-radius: 7px; background: {GREEN_50};
-    border: 1.5px solid {GREEN_200}; padding: 16px 18px; margin: 6px 0 14px;
+  .forecast {{ border-radius: 7px; background: {GOOD_BG};
+    border: 1.5px solid {GOOD_LIGHT}; padding: 16px 18px; margin: 6px 0 14px;
     display: flex; align-items: center; gap: 16px; }}
-  .forecast.warn {{ background: #FDF0F0; border-color: #F3B0B0; }}
+  .forecast.warn {{ background: {OVER_BG}; border-color: #DDA79D; }}
   /* 中間（曇り）はどちらにも転びうる状態。晴と混ぜず無彩色にする */
   .forecast.edge {{ background: {PAPER}; border-color: {LINE}; }}
   .forecast .fc-icon {{ font-size: 38px; line-height: 1; }}
@@ -2150,7 +2156,7 @@ if role:
                                     f'<tr><td class="k">臨時収入'
                                     f'<span class="hc-ytd">{inc_note}</span></td>'
                                     f'<td class="v" style="color:'
-                                    f'{GREEN_900 if x["inc"] else SUBTLE}">{fyen(x["inc"])}</td></tr>'
+                                    f'{GOOD if x["inc"] else SUBTLE}">{fyen(x["inc"])}</td></tr>'
                                     f'<tr><td class="k"><b>これらを含めた収支</b></td>'
                                     f'<td class="v"><b>{fyen(real)}</b></td></tr>'
                                     f'</table></div>')
@@ -2205,10 +2211,10 @@ if role:
                                     f'<tr><td class="k">今後の固定費 {fyen(r["upcoming"])} を'
                                     f'引いた収支</td>'
                                     f'<td class="v" style="color:'
-                                    f'{GREEN_900 if fc_bal >= 0 else ERROR}">{fyen(fc_bal)}</td></tr>'
+                                    f'{GOOD if fc_bal >= 0 else ERROR}">{fyen(fc_bal)}</td></tr>'
                                     f'<tr><td class="k">予算に対して1日あたり使えるのは</td>'
                                     f'<td class="v" style="color:'
-                                    f'{GREEN_900 if r["per_day"] else SUBTLE}">{fc_day}</td></tr>'
+                                    f'{GOOD if r["per_day"] else SUBTLE}">{fc_day}</td></tr>'
                                     f'</table></div>',
                                     unsafe_allow_html=True)
                                 st.caption(
@@ -2243,7 +2249,7 @@ if role:
                                            f'{fyen(landing_over)}</b> 超えちゃいそう。')
                                     note = "最後まであきらめないで。"
                                 elif kind == "under":
-                                    msg = (f'このままなら <b style="color:{GREEN_900}">'
+                                    msg = (f'このままなら <b style="color:{GOOD}">'
                                            f'{fyen(-landing_over)}</b> 余りそう。')
                                     note = ""
                                 elif kind == "edge":
@@ -2284,7 +2290,7 @@ if role:
 
                                 # ---- MFに無い独自の2つ。第1階層を汚さずにここへ置く ----
                                 if r["per_day"]:
-                                    pd_val, pd_sub, pd_col = fyen(r["per_day"]), span, GREEN_900
+                                    pd_val, pd_sub, pd_col = fyen(r["per_day"]), span, GOOD
                                 elif over:
                                     pd_val, pd_sub, pd_col = "¥0", "予算を超えています", ERROR
                                 else:
@@ -2296,7 +2302,7 @@ if role:
                                     rate_val = f"{rate_est:.1f}%"
                                     rate_sub = (f"目標 {target*100:.0f}% に対して {gap:+.1f}pt"
                                                 f" ／ 着地見込み {fyen(land)}")
-                                    rate_col = GREEN_900 if gap >= 0 else ERROR
+                                    rate_col = GOOD if gap >= 0 else ERROR
                                 st.markdown(
                                     '<div class="pace-hero">'
                                     + cell("1日あたり使えるのは", pd_val, pd_sub, pd_col)
@@ -2314,9 +2320,11 @@ if role:
                                              "選んだ基準日は変動費・固定費の内訳にも効きます。")
                                     if use_prov:
                                         st.caption(
-                                            f":orange[速報表示中]　{prov_ts.month}/{prov_ts.day}まで。"
+                                            f'<span style="color:{PENDING};font-weight:600">速報表示中</span>'
+                                            f"　{prov_ts.month}/{prov_ts.day}まで。"
                                             f"確定より {fyen(r_prov['spent'] - r_fix['spent'])} 多く"
-                                            "計上されていますが、この日数分はまだ増えます。")
+                                            "計上されていますが、この日数分はまだ増えます。",
+                                            unsafe_allow_html=True)
                                 freshness_caption()
 
                                 st.markdown("##### 内訳")
