@@ -2572,7 +2572,7 @@ if role:
                                 fig.add_trace(go.Scatter(
                                     x=list(range(1, dim + 1)), y=cur_cum, mode="lines",
                                     name=month_label(pace_month),
-                                    line=dict(color=GREEN_600, width=3),
+                                    line=dict(color=GREEN_900, width=3),
                                     hovertemplate="%{y:,.0f}円<extra>"
                                                   + month_label(pace_month) + "</extra>"))
                                 fig.add_vline(x=cur_day, line=dict(color=SUBTLE, width=1, dash="dot"))
@@ -2617,7 +2617,7 @@ if role:
                                     hovertemplate="%{y:,.0f}円<extra>特別な支出</extra>"))
                                 fig.add_trace(go.Bar(
                                     x=xs, y=[v["inc"] for v in rows], name="臨時収入",
-                                    marker_color=GREEN_600,
+                                    marker_color=GOOD,
                                     hovertemplate="%{y:,.0f}円<extra>臨時収入</extra>"))
                                 fig.add_trace(go.Scatter(
                                     x=xs, y=[v["inc"] - v["exp"] for v in rows], name="差引",
@@ -2716,7 +2716,7 @@ if role:
                                 fig2 = go.Figure()
                                 fig2.add_trace(go.Bar(
                                     x=xs, y=[chart["series"][m] for m in ms2], name="実績",
-                                    marker_color=[GREEN_600 if m == sel_m else GRAY_200
+                                    marker_color=[GREEN_900 if m == sel_m else GRAY_200
                                                   for m in ms2],
                                     hovertemplate="%{y:,.0f}円<extra>%{x}</extra>"))
                                 if b_ > 0:
@@ -2815,7 +2815,9 @@ if role:
                                     textposition="outside", textangle=-90 if many else 0,
                                     textfont=dict(size=9, color=SUBTLE), cliponaxis=False)
                     fig.add_scatter(x=trend["label"], y=trend["収支"], name="収支",
-                                    mode="lines+markers", line=dict(color=INK, width=2),
+                                    mode="lines+markers", line=dict(color=SUBTLE, width=2),
+                                    marker=dict(color=[GOOD if v >= 0 else ERROR
+                                                       for v in trend["収支"]], size=7),
                                     hovertemplate=HOVER_YEN)
                     peak = max(trend["収入"].max(), trend["支出"].max()) if len(trend) else 0
                     if peak > 0:
@@ -2835,7 +2837,7 @@ if role:
                         total = cat_sum.sum()
                         fig = go.Figure(go.Bar(
                             x=vals.values, y=vals.index, orientation="h",
-                            marker_color=[cat_color(c) for c in vals.index],
+                            marker_color=GRAY_200,
                             text=[f"{fyen(v)}（{v / total * 100:.1f}%）" for v in vals.values],
                             textposition="outside", cliponaxis=False,
                             textfont=dict(size=10, color=INK),
@@ -2891,7 +2893,7 @@ if role:
                         many = len(series) > 8
                         fig = go.Figure(go.Bar(
                             x=[m[2:].replace("-", "/") for m in series.index], y=series.values,
-                            marker_color=cat_color(sel_cat), hovertemplate=HOVER_YEN, name=sel_cat,
+                            marker_color=GREEN_900, hovertemplate=HOVER_YEN, name=sel_cat,
                             text=None if IS_MOBILE else [man_label(v) for v in series.values],
                             textposition="outside", textangle=-90 if many else 0,
                             textfont=dict(size=9, color=SUBTLE), cliponaxis=False))
@@ -2916,7 +2918,7 @@ if role:
                         sub_total = sub_sum.sum()
                         fig = go.Figure(go.Bar(
                             x=sub_sum.values, y=sub_sum.index, orientation="h",
-                            marker_color=cat_color(sel_cat),
+                            marker_color=GREEN_900,
                             text=[f"{fyen(v)}（{v / sub_total * 100:.1f}%）" for v in sub_sum.values],
                             textposition="outside", cliponaxis=False,
                             textfont=dict(size=10, color=INK),
@@ -2996,7 +2998,7 @@ if role:
                     fig_ratio = go.Figure(go.Scatter(
                         x=[m[2:].replace("-", "/") for m in ratio_series.index],
                         y=ratio_series.values, mode="lines+markers", showlegend=False,
-                        line=dict(color=GREEN_600, width=2),
+                        line=dict(color=GREEN_900, width=2),
                         hovertemplate="%{y:.1f}%<extra>%{x}</extra>"))
                     st.plotly_chart(base_layout(fig_ratio, height=200), width="stretch",
                                     config=PLOTLY_CONFIG)
