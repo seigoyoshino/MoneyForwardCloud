@@ -247,9 +247,13 @@ def apply_scope(df: pd.DataFrame, exclude_special: bool) -> pd.DataFrame:
     return df[~drop_exp & ~drop_inc]
 
 
-# スマホでは月次の棒グラフを直近Nヶ月に絞る。400px幅では24ヶ月でバーが約7pxになり、
-# 値ラベルも潰れて判読できないため。
+# 月次の棒グラフに載せる月数の上限。スマホは400px幅では24ヶ月でバーが約7pxになり、
+# 値ラベルも潰れて判読できないため、さらに狭める。
+# PC側にも上限を置くのは、明細の期間が5年を超えて棒が並びきらなくなったため。
+# 月次の推移を見る目的なら2年で足り、それより長い比較は年モードのほうが向いている。
+# ⚠️ 集計・KPI・表は全期間のまま。ここで絞るのは横軸に載せる月だけ
 CHART_MONTHS_MOBILE = 12
+CHART_MONTHS = 24
 
 
 def is_fixed(df: pd.DataFrame, cats: list[str] | None = None,
@@ -1140,10 +1144,9 @@ def is_mobile() -> bool:
 
 
 def chart_window(month_list: list[str], mobile: bool) -> list[str]:
-    """棒グラフに載せる月を絞る（スマホのみ）。集計そのものには影響しない。"""
-    if mobile and len(month_list) > CHART_MONTHS_MOBILE:
-        return month_list[-CHART_MONTHS_MOBILE:]
-    return month_list
+    """棒グラフに載せる月を絞る。集計そのものには影響しない。"""
+    n = CHART_MONTHS_MOBILE if mobile else CHART_MONTHS
+    return month_list[-n:] if len(month_list) > n else month_list
 
 
 def filled_months(months: list[str]) -> list[str]:
@@ -2865,7 +2868,8 @@ if role:
                     st.plotly_chart(base_layout(fig), width="stretch", config=PLOTLY_CONFIG)
                     if mode != "年" and len(chart_months) < len(all_months):
                         st.caption(f"グラフは直近{len(chart_months)}ヶ月を表示しています"
-                                   "（スマホ表示・上のKPIと下の表は選んだ期間のままです）。")
+                                   "（上のKPIと下の表は選んだ期間のままです）。"
+                                   "それ以前も含めて見るときは、期間を「年」にしてください。")
 
                     exp = period[period["amount"] < 0]
                     cat_sum = (-exp.groupby("cat")["amount"].sum()).sort_values(ascending=False)
@@ -2941,8 +2945,13 @@ if role:
                             text=None if IS_MOBILE else [man_label(v) for v in series.values],
                             textposition="outside", textangle=-90 if many else 0,
                             textfont=dict(size=9, color=SUBTLE), cliponaxis=False))
+                        # 平均はグラフに描いた月だけで取る。ラベルにも期間を書いて、
+                        # 「全期間の平均」と読み違えられないようにする
                         fig.add_hline(y=series.mean(), line_dash="dash", line_color=SUBTLE,
-                                      annotation_text=f"月平均 {fyen(series.mean())}",
+                                      annotation_text=(
+                                          f"直近{len(series)}ヶ月の月平均 {fyen(series.mean())}"
+                                          if len(chart_months) < len(all_months)
+                                          else f"月平均 {fyen(series.mean())}"),
                                       annotation_font_size=11)
                         if series.max() > 0:
                             fig.update_yaxes(range=[0, float(series.max()) * 1.25])
