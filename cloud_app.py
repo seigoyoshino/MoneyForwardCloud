@@ -1991,7 +1991,11 @@ if role:
                     else:
                         pv = valid
                     ex_exp, ex_inc, _, _ = _sp(pv)
-                    win = [m for m in all_months if m in set(valid["month"])][-12:]
+                    # ⚠️ set() は内包表記の**外**で作ること。条件節に置くと all_months の
+                    # 要素ごとに作り直され、月数×行数の二重ループになる。明細が5年ぶんに
+                    # 増えてから、ここだけで実測0.55秒（66ヶ月 × 約1.4万行）を使っていた
+                    have_months = set(valid["month"])
+                    win = [m for m in all_months if m in have_months][-12:]
                     rows = []
                     for m in win:
                         e, i, ec, ic = _sp(valid[valid["month"] == m])
@@ -2029,9 +2033,10 @@ if role:
                     bl_start = baseline_from()
                     want = [m for m in prev_months(pace_month, BASELINE_WINDOW)
                             if not bl_start or m >= bl_start]
-                    have = [m for m in want if m in set(pdf["month"])]
+                    pdf_months = set(pdf["month"])          # 内包表記の外で1回だけ作る
+                    have = [m for m in want if m in pdf_months]
 
-                    if pace_month not in set(pdf["month"]):
+                    if pace_month not in pdf_months:
                         st.info(f"{month_label(pace_month)} のデータがまだありません。")
                     elif not have:
                         st.warning(
@@ -2110,8 +2115,11 @@ if role:
                             # 固定費の着地。「見込み」と書くと基準線の月額見込みと混同されるので、
                             # ここは**今月の着地**（実績＋これから落ちるぶん）と呼ぶ
                             fx_land = fixed_paid + r["upcoming"]
+                            # is_fixed() は明細全体を走査する。条件節に置くと bl["exp"] の
+                            # 件数だけ呼ばれるので、これも外で1回だけ作る
+                            fixed_subs_now = set(pdf.loc[is_fixed(pdf), "sub"].unique())
                             fx_plan = sum(d["value"] for s, d in bl["exp"].items()
-                                          if s in set(pdf.loc[is_fixed(pdf), "sub"].unique()))
+                                          if s in fixed_subs_now)
                             fx_gap = fx_land - fx_plan
 
                             total_budget = r["remain"] + var_paid      # 変動費の総枠（月間）
