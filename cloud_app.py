@@ -1160,7 +1160,12 @@ def filled_months(months: list[str]) -> list[str]:
 
 
 # ---------- データ読込・認証 ----------
-@st.cache_data(ttl=300, show_spinner="データを読み込んでいます...")
+# バンドルの取得は GitHub API 経由で、実測 2.4〜3.0 秒かかる（blob API の転送が大半）。
+# ttl が短いとその待ちが定期的に表に出るので長めに取る。データが変わるのは手元で
+# update_cloud_data.bat を回したときだけで、サイドバーに手動取得のボタンもある。
+# ⚠️ 長くしたぶん「バッチを回した直後に見ると古い」が起こりうる。サイドバーの
+# 「データ更新」の時刻表示で気づけるようにしてあるので、あれは消さないこと
+@st.cache_data(ttl=3600, show_spinner="データを読み込んでいます...")
 def fetch_bundle(repo: str, path: str, branch: str, gh_token: str) -> bytes:
     """非公開リポジトリから暗号化データを取得する（GitHub API）。"""
     import base64
@@ -1188,8 +1193,18 @@ def fetch_bundle(repo: str, path: str, branch: str, gh_token: str) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def decrypt_bundle(token: bytes, key: str) -> dict:
+    """バンドルを復号する。gzip 圧縮の有無は**中身のマジックバイトで見分ける**。
+
+    ⚠️ この両対応は消さないこと。書き出し側（非公開リポジトリの
+    `tools/export_cloud.py`）とここは別リポジトリにあり、同時にはデプロイできない。
+    片方だけ切り替わっている時間が必ず生まれるので、読み手は新旧どちらの形式も
+    読めなければならない（書き出し側を戻したときのためにも要る）。
+    """
     from cryptography.fernet import Fernet
     raw = Fernet(key.encode()).decrypt(token)
+    if raw[:2] == b"\x1f\x8b":          # gzip のマジックバイト
+        import gzip
+        raw = gzip.decompress(raw)
     return json.loads(raw.decode("utf-8"))
 
 
